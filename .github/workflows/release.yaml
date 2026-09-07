@@ -35,7 +35,7 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64 # ,linux/arm64,linux/arm/v7  (uncomment once the fix for long builds is found).
           push: true
-          tags: ghcr.io/intreecom/robotlb:latest,ghcr.io/intreecom/robotlb:${{ github.ref_name }}
+          tags: ghcr.io/treetscom/robotlb:latest,ghcr.io/treetscom/robotlb:${{ github.ref_name }}
 
   upload_helm:
     runs-on: ubuntu-latest
@@ -53,6 +53,6 @@ jobs:
           helm package --app-version "${{ github.ref_name }}" --dependency-update ./helm
           helm show chart *.tgz
           helm registry login -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }} ghcr.io
-          helm push *.tgz oci://ghcr.io/intreecom/charts
+          helm push *.tgz oci://ghcr.io/treetscom/charts
         env:
           HELM_EXPERIMENTAL_OCI: 1
