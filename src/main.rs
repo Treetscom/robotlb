@@ -297,6 +297,47 @@ async fn get_nodes_by_selector(
     Ok(nodes)
 }
 
+/// Get every node of the cluster.
+async fn get_all_nodes(context: &Arc<CurrentContext>) -> RobotLBResult<Vec<Node>> {
+    let nodes_api = kube::Api::<Node>::all(context.client.clone());
+    Ok(nodes_api.list(&ListParams::default()).await?.items)
+}
+
+/// Whether the service asks for traffic to reach only the nodes that host its endpoints.
+/// Under the default `Cluster` policy every node is a valid target, because kube-proxy
+/// forwards the traffic to a node that actually hosts a pod.
+///
+/// <https://kubernetes.io/docs/reference/networking/virtual-ips/#external-traffic-policy>
+fn is_local_traffic_policy(svc: &Service) -> bool {
+    svc.spec
+        .as_ref()
+        .and_then(|spec| spec.external_traffic_policy.as_deref())
+        == Some("Local")
+}
+
+/// Map the ports of a service onto load balancer services,
+/// as pairs of a listen port and the node port behind it.
+fn collect_lb_services(svc: &Service) -> Vec<(i32, i32)> {
+    let mut services = Vec::new();
+    for port in svc.spec.iter().flat_map(|spec| spec.ports.iter().flatten()) {
+        let protocol = port.protocol.as_deref().unwrap_or("TCP");
+        if protocol != "TCP" {
+            tracing::warn!("Protocol {} is not supported. Skipping...", protocol);
+            continue;
+        }
+        let Some(node_port) = port.node_port else {
+            tracing::warn!(
+                "Service port {} has no nodePort allocated. Hetzner load balancers forward \
+                 traffic to node IPs, so such a port cannot be exposed. Skipping...",
+                port.port
+            );
+            continue;
+        };
+        services.push((port.port, node_port));
+    }
+    services
+}
+
 /// Reconcile the `LoadBalancer` type of service.
 /// This function will find the nodes based on the node selector
 /// and create or update the load balancer.
@@ -311,7 +352,11 @@ pub async fn reconcile_load_balancer(
     }
 
     let nodes = if context.config.dynamic_node_selector {
-        get_nodes_dynamically(&svc, &context).await?
+        if is_local_traffic_policy(&svc) {
+            get_nodes_dynamically(&svc, &context).await?
+        } else {
+            get_all_nodes(&context).await?
+        }
     } else {
         get_nodes_by_selector(&svc, &context).await?
     };
@@ -330,26 +375,8 @@ pub async fn reconcile_load_balancer(
         }
     }
 
-    for port in svc
-        .spec
-        .clone()
-        .unwrap_or_default()
-        .ports
-        .unwrap_or_default()
-    {
-        let protocol = port.protocol.unwrap_or_else(|| "TCP".to_string());
-        if protocol != "TCP" {
-            tracing::warn!("Protocol {} is not supported. Skipping...", protocol);
-            continue;
-        }
-        let Some(node_port) = port.node_port else {
-            tracing::warn!(
-                "Node port is not set for target_port {}. Skipping...",
-                port.port
-            );
-            continue;
-        };
-        lb.add_service(port.port, node_port);
+    for (listen_port, node_port) in collect_lb_services(&svc) {
+        lb.add_service(listen_port, node_port);
     }
 
     let svc_api = kube::Api::<Service>::namespaced(
@@ -409,5 +436,95 @@ fn on_error(_: Arc<Service>, error: &RobotLBError, _context: Arc<CurrentContext>
     match error {
         RobotLBError::SkipService => Action::await_change(),
         _ => Action::requeue(Duration::from_secs(30)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_lb_services, is_local_traffic_policy};
+    use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
+
+    fn service(spec: ServiceSpec) -> Service {
+        Service {
+            spec: Some(spec),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cluster_policy_is_not_local() {
+        let svc = service(ServiceSpec {
+            external_traffic_policy: Some("Cluster".into()),
+            ..Default::default()
+        });
+        assert!(!is_local_traffic_policy(&svc));
+    }
+
+    #[test]
+    fn unset_policy_defaults_to_cluster() {
+        assert!(!is_local_traffic_policy(&service(ServiceSpec::default())));
+    }
+
+    #[test]
+    fn local_policy_is_local() {
+        let svc = service(ServiceSpec {
+            external_traffic_policy: Some("Local".into()),
+            ..Default::default()
+        });
+        assert!(is_local_traffic_policy(&svc));
+    }
+
+    #[test]
+    fn ports_map_listen_port_to_node_port() {
+        let svc = service(ServiceSpec {
+            ports: Some(vec![ServicePort {
+                port: 22,
+                node_port: Some(30821),
+                protocol: Some("TCP".into()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        assert_eq!(collect_lb_services(&svc), vec![(22, 30821)]);
+    }
+
+    #[test]
+    fn ports_without_protocol_are_treated_as_tcp() {
+        let svc = service(ServiceSpec {
+            ports: Some(vec![ServicePort {
+                port: 80,
+                node_port: Some(31571),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        assert_eq!(collect_lb_services(&svc), vec![(80, 31571)]);
+    }
+
+    #[test]
+    fn udp_ports_are_skipped() {
+        let svc = service(ServiceSpec {
+            ports: Some(vec![ServicePort {
+                port: 53,
+                node_port: Some(30053),
+                protocol: Some("UDP".into()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        assert!(collect_lb_services(&svc).is_empty());
+    }
+
+    #[test]
+    fn ports_without_node_port_are_skipped() {
+        let svc = service(ServiceSpec {
+            ports: Some(vec![ServicePort {
+                port: 22,
+                protocol: Some("TCP".into()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        assert!(collect_lb_services(&svc).is_empty());
     }
 }
