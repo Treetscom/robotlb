@@ -27,6 +27,17 @@ repos:
           - clippy
           - --all
 
+      - id: test
+        types:
+          - rust
+        name: cargo test
+        language: system
+        pass_filenames: false
+        entry: cargo
+        args:
+          - test
+          - --all
+
       - id: check
         types:
           - rust
