@@ -35,7 +35,14 @@ After the chart is installed, you should be able to create `LoadBalancer` servic
 
 The operator listens to the Kubernetes API for services of type `LoadBalancer` and creates Hetzner load balancers that point to nodes based on `node-ip`.
 
-Nodes are selected based on where the service's target pods are deployed, which is determined by searching for pods with the service's selector. This behavior can be configured.
+Target nodes are selected according to the service's `externalTrafficPolicy`:
+
+- `Cluster`, the Kubernetes default: every node of the cluster becomes a target, since kube-proxy forwards the traffic to a node that hosts a pod.
+- `Local`: only the nodes where the service's target pods run, found through the service selector, or through the service's `EndpointSlice` resources when it has no selector.
+
+Setting `ROBOTLB_DYNAMIC_NODE_SELECTOR` to `false` replaces both with the node selector from the `robotlb/node-selector` annotation.
+
+Every port of the service needs an allocated `nodePort`. A Hetzner load balancer forwards traffic to the IP of a node, so a port is reachable only through its `nodePort`: ports without one are skipped, and `allocateLoadBalancerNodePorts: false` is not supported.
 
 
 ## Configuration
