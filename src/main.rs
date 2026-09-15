@@ -220,7 +220,7 @@ async fn get_nodes_dynamically(
         .list(&ListParams::default())
         .await?
         .into_iter()
-        .filter(|node| target_nodes.contains(&node.name_any()))
+        .filter(|node| target_nodes.contains(&node.name_any()) && !is_excluded_from_lb(node))
         .collect::<Vec<_>>();
 
     Ok(nodes)
@@ -268,7 +268,7 @@ async fn get_nodes_from_endpointslices(
         .list(&ListParams::default())
         .await?
         .into_iter()
-        .filter(|node| target_nodes.contains(&node.name_any()))
+        .filter(|node| target_nodes.contains(&node.name_any()) && !is_excluded_from_lb(node))
         .collect::<Vec<_>>();
 
     Ok(nodes)
@@ -292,7 +292,7 @@ async fn get_nodes_by_selector(
         .list(&ListParams::default())
         .await?
         .into_iter()
-        .filter(|node| label_filter.check(node.labels()))
+        .filter(|node| label_filter.check(node.labels()) && !is_excluded_from_lb(node))
         .collect::<Vec<_>>();
     Ok(nodes)
 }
@@ -309,14 +309,18 @@ async fn get_all_nodes(context: &Arc<CurrentContext>) -> RobotLBResult<Vec<Node>
     Ok(nodes)
 }
 
-/// Whether a node may be used as a load balancer target.
-/// Cordoned nodes are draining, and the exclusion label is how a cluster declares
-/// that a node must stay out of external load balancers.
-fn is_lb_eligible_node(node: &Node) -> bool {
-    if node
-        .labels()
+/// Whether the cluster declares that a node must stay out of external load balancers.
+/// The label holds under every traffic policy, the way upstream cloud providers treat it.
+fn is_excluded_from_lb(node: &Node) -> bool {
+    node.labels()
         .contains_key(consts::EXCLUDE_FROM_LB_LABEL_NAME)
-    {
+}
+
+/// Whether a node may be used as a load balancer target under the `Cluster` policy,
+/// where any node can carry the traffic and a draining or unhealthy one only takes
+/// up a target slot.
+fn is_lb_eligible_node(node: &Node) -> bool {
+    if is_excluded_from_lb(node) {
         tracing::debug!("Node {} is excluded from load balancers", node.name_any());
         return false;
     }
@@ -324,7 +328,38 @@ fn is_lb_eligible_node(node: &Node) -> bool {
         tracing::debug!("Node {} is unschedulable", node.name_any());
         return false;
     }
+    let ready = node
+        .status
+        .as_ref()
+        .and_then(|status| status.conditions.as_ref())
+        .and_then(|conditions| conditions.iter().find(|cond| cond.type_ == "Ready"))
+        .map(|cond| cond.status.as_str());
+    if matches!(ready, Some(status) if status != "True") {
+        tracing::debug!("Node {} is not ready", node.name_any());
+        return false;
+    }
     true
+}
+
+/// Where the target nodes of a service come from.
+#[derive(Debug, PartialEq, Eq)]
+enum NodeSource {
+    /// The `robotlb/node-selector` annotation of the service.
+    Annotation,
+    /// The nodes hosting the endpoints of the service.
+    ServiceEndpoints,
+    /// Every node that may serve load balancer traffic.
+    AllNodes,
+}
+
+fn node_source(svc: &Service, dynamic_node_selector: bool) -> NodeSource {
+    if !dynamic_node_selector {
+        return NodeSource::Annotation;
+    }
+    if is_local_traffic_policy(svc) {
+        return NodeSource::ServiceEndpoints;
+    }
+    NodeSource::AllNodes
 }
 
 /// Whether the service asks for traffic to reach only the nodes that host its endpoints.
@@ -377,14 +412,10 @@ pub async fn reconcile_load_balancer(
         node_ip_type = "ExternalIP";
     }
 
-    let nodes = if context.config.dynamic_node_selector {
-        if is_local_traffic_policy(&svc) {
-            get_nodes_dynamically(&svc, &context).await?
-        } else {
-            get_all_nodes(&context).await?
-        }
-    } else {
-        get_nodes_by_selector(&svc, &context).await?
+    let nodes = match node_source(&svc, context.config.dynamic_node_selector) {
+        NodeSource::Annotation => get_nodes_by_selector(&svc, &context).await?,
+        NodeSource::ServiceEndpoints => get_nodes_dynamically(&svc, &context).await?,
+        NodeSource::AllNodes => get_all_nodes(&context).await?,
     };
 
     for node in nodes {
@@ -405,18 +436,20 @@ pub async fn reconcile_load_balancer(
         lb.add_service(service.listen_port, service.target_port);
     }
 
-    if lb.services.is_empty() {
-        tracing::warn!(
-            "Service has no port that can be exposed. Leaving it without an external IP."
-        );
-    }
-
     let svc_api = kube::Api::<Service>::namespaced(
         context.client.clone(),
         svc.namespace()
             .unwrap_or_else(|| context.client.default_namespace().to_string())
             .as_str(),
     );
+
+    // A balancer without a single service forwards nothing while still being billed,
+    // so none is created until the service has a port that can be exposed.
+    if lb.services.is_empty() {
+        tracing::warn!("Service has no port that can be exposed. Skipping the load balancer.");
+        clear_ingress_status(&svc_api, &svc).await?;
+        return Ok(Action::requeue(Duration::from_secs(30)));
+    }
 
     let hcloud_lb = lb.reconcile().await?;
 
@@ -443,7 +476,7 @@ pub async fn reconcile_load_balancer(
         }
     }
 
-    if !ingress.is_empty() && !lb.services.is_empty() {
+    if !ingress.is_empty() {
         svc_api
             .patch_status(
                 svc.name_any().as_str(),
@@ -462,6 +495,35 @@ pub async fn reconcile_load_balancer(
     Ok(Action::requeue(Duration::from_secs(30)))
 }
 
+/// Drop the external IP a service advertises, so that nothing keeps sending
+/// traffic to a load balancer that no longer forwards it.
+async fn clear_ingress_status(svc_api: &kube::Api<Service>, svc: &Service) -> RobotLBResult<()> {
+    let advertises_ingress = svc
+        .status
+        .as_ref()
+        .and_then(|status| status.load_balancer.as_ref())
+        .and_then(|lb| lb.ingress.as_ref())
+        .is_some_and(|ingress| !ingress.is_empty());
+    if !advertises_ingress {
+        return Ok(());
+    }
+    tracing::info!("Removing the external IP from the service status");
+    svc_api
+        .patch_status(
+            svc.name_any().as_str(),
+            &PatchParams::default(),
+            &kube::api::Patch::Merge(json!({
+                "status": {
+                    "loadBalancer": {
+                        "ingress": null
+                    }
+                }
+            })),
+        )
+        .await?;
+    Ok(())
+}
+
 /// Handle the error during reconcilation.
 #[allow(clippy::needless_pass_by_value)]
 fn on_error(_: Arc<Service>, error: &RobotLBError, _context: Arc<CurrentContext>) -> Action {
@@ -473,9 +535,14 @@ fn on_error(_: Arc<Service>, error: &RobotLBError, _context: Arc<CurrentContext>
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_lb_services, consts, is_lb_eligible_node, is_local_traffic_policy};
+    use super::{
+        collect_lb_services, consts, is_excluded_from_lb, is_lb_eligible_node,
+        is_local_traffic_policy, node_source, NodeSource,
+    };
     use k8s_openapi::{
-        api::core::v1::{Node, NodeSpec, Service, ServicePort, ServiceSpec},
+        api::core::v1::{
+            Node, NodeCondition, NodeSpec, NodeStatus, Service, ServicePort, ServiceSpec,
+        },
         apimachinery::pkg::apis::meta::v1::ObjectMeta,
     };
     use std::collections::BTreeMap;
@@ -503,6 +570,20 @@ mod tests {
                 ..Default::default()
             }),
             ..Default::default()
+        }
+    }
+
+    fn node_with_ready_condition(status: &str) -> Node {
+        Node {
+            status: Some(NodeStatus {
+                conditions: Some(vec![NodeCondition {
+                    type_: "Ready".to_string(),
+                    status: status.to_string(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..node(&[], false)
         }
     }
 
@@ -608,5 +689,48 @@ mod tests {
     #[test]
     fn cordoned_node_is_not_eligible() {
         assert!(!is_lb_eligible_node(&node(&[], true)));
+    }
+
+    #[test]
+    fn ready_node_is_eligible() {
+        assert!(is_lb_eligible_node(&node_with_ready_condition("True")));
+    }
+
+    #[test]
+    fn not_ready_node_is_not_eligible() {
+        assert!(!is_lb_eligible_node(&node_with_ready_condition("False")));
+    }
+
+    #[test]
+    fn exclusion_label_is_recognised_on_its_own() {
+        assert!(is_excluded_from_lb(&node(
+            &[(consts::EXCLUDE_FROM_LB_LABEL_NAME, "")],
+            false
+        )));
+        assert!(!is_excluded_from_lb(&node(&[], true)));
+    }
+
+    #[test]
+    fn cluster_policy_takes_every_node() {
+        let svc = service(ServiceSpec::default());
+        assert_eq!(node_source(&svc, true), NodeSource::AllNodes);
+    }
+
+    #[test]
+    fn local_policy_takes_endpoint_nodes() {
+        let svc = service(ServiceSpec {
+            external_traffic_policy: Some("Local".into()),
+            ..Default::default()
+        });
+        assert_eq!(node_source(&svc, true), NodeSource::ServiceEndpoints);
+    }
+
+    #[test]
+    fn static_selector_wins_over_the_policy() {
+        let svc = service(ServiceSpec {
+            external_traffic_policy: Some("Local".into()),
+            ..Default::default()
+        });
+        assert_eq!(node_source(&svc, false), NodeSource::Annotation);
     }
 }
