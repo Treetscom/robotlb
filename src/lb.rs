@@ -327,7 +327,7 @@ impl LoadBalancer {
                 .any(|t| t.ip.as_ref().map(|i| i.ip.as_str()) == Some(ip))
             {
                 tracing::info!("Adding target {}", ip);
-                hcloud::apis::load_balancers_api::add_target(
+                let added = hcloud::apis::load_balancers_api::add_target(
                     &self.hcloud_config,
                     AddTargetParams {
                         id: hcloud_balancer.id,
@@ -339,7 +339,12 @@ impl LoadBalancer {
                         }),
                     },
                 )
-                .await?;
+                .await;
+                // Hetzner rejects IPs outside the vSwitch subnet of the attached network,
+                // which must not keep the remaining nodes out of the load balancer.
+                if let Err(error) = added {
+                    tracing::error!("Cannot add target {ip}: {error}");
+                }
             }
         }
         Ok(())
