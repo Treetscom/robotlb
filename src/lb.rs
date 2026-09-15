@@ -300,11 +300,28 @@ impl LoadBalancer {
         &self,
         hcloud_balancer: &hcloud::models::LoadBalancer,
     ) -> RobotLBResult<()> {
+        let max_targets =
+            usize::try_from(hcloud_balancer.load_balancer_type.max_targets).unwrap_or(usize::MAX);
+        let planned = plan_targets(&self.targets, max_targets);
+        if planned.len() < self.targets.len()
+            // While a type change is in flight the balancer still reports the old type,
+            // whose limit says nothing about the type the service asked for.
+            && hcloud_balancer.load_balancer_type.name == self.balancer_type
+        {
+            tracing::warn!(
+                "Selected {} node(s), but a {} balancer holds at most {}. \
+                 Use a bigger balancer type or externalTrafficPolicy: Local.",
+                self.targets.len(),
+                hcloud_balancer.load_balancer_type.name,
+                max_targets,
+            );
+        }
+
         for target in &hcloud_balancer.targets {
             let Some(target_ip) = target.ip.clone() else {
                 continue;
             };
-            if !self.targets.contains(&target_ip.ip) {
+            if !planned.contains(&target_ip.ip.as_str()) {
                 tracing::info!("Removing target {}", target_ip.ip);
                 hcloud::apis::load_balancers_api::remove_target(
                     &self.hcloud_config,
@@ -320,54 +337,49 @@ impl LoadBalancer {
             }
         }
 
-        let max_targets = hcloud_balancer.load_balancer_type.max_targets;
-        if i64::try_from(self.targets.len()).unwrap_or(i64::MAX) > max_targets {
-            tracing::warn!(
-                "Selected {} target(s), but a {} balancer holds at most {}. \
-                 Use a bigger balancer type or externalTrafficPolicy: Local.",
-                self.targets.len(),
-                hcloud_balancer.load_balancer_type.name,
-                max_targets,
-            );
-        }
-
-        let mut attempted = 0_usize;
-        let mut failed = 0_usize;
-        for ip in &self.targets {
-            if !hcloud_balancer
+        let mut live = 0_usize;
+        let mut last_error = None;
+        for ip in &planned {
+            if hcloud_balancer
                 .targets
                 .iter()
-                .any(|t| t.ip.as_ref().map(|i| i.ip.as_str()) == Some(ip))
+                .any(|t| t.ip.as_ref().map(|i| i.ip.as_str()) == Some(*ip))
             {
-                tracing::info!("Adding target {}", ip);
-                let added = hcloud::apis::load_balancers_api::add_target(
-                    &self.hcloud_config,
-                    AddTargetParams {
-                        id: hcloud_balancer.id,
-                        body: Some(LoadBalancerAddTarget {
-                            ip: Some(Box::new(hcloud::models::LoadBalancerTargetIp {
-                                ip: ip.clone(),
-                            })),
-                            ..Default::default()
-                        }),
-                    },
-                )
-                .await;
-                attempted += 1;
-                // Hetzner rejects IPs outside the vSwitch subnet of the attached network,
-                // which must not keep the remaining nodes out of the load balancer.
-                if let Err(error) = added {
-                    failed += 1;
+                live += 1;
+                continue;
+            }
+            tracing::info!("Adding target {}", ip);
+            let added = hcloud::apis::load_balancers_api::add_target(
+                &self.hcloud_config,
+                AddTargetParams {
+                    id: hcloud_balancer.id,
+                    body: Some(LoadBalancerAddTarget {
+                        ip: Some(Box::new(hcloud::models::LoadBalancerTargetIp {
+                            ip: (*ip).to_string(),
+                        })),
+                        ..Default::default()
+                    }),
+                },
+            )
+            .await;
+            // Hetzner rejects IPs outside the vSwitch subnet of the attached network,
+            // which must not keep the remaining nodes out of the load balancer.
+            match added {
+                Ok(_) => live += 1,
+                Err(error) => {
                     tracing::warn!("Cannot add target {ip}: {error}");
+                    last_error = Some(error.to_string());
                 }
             }
         }
-        // Losing every single target is a failure of the whole reconciliation, not a
-        // rejected node: the service must not be reported as ready in that case.
-        if attempted > 0 && attempted == failed {
+        // A balancer left without a single target forwards nothing, so the service
+        // must not be reported as ready. Counting what is live rather than what this
+        // run attempted keeps a permanently rejected node from failing every run.
+        if !planned.is_empty() && live == 0 {
             return Err(RobotLBError::HCloudError(format!(
-                "None of the {attempted} target(s) could be added to load balancer {}",
-                self.name
+                "No target could be added to load balancer {}: {}",
+                self.name,
+                last_error.unwrap_or_else(|| "no reason reported".to_string()),
             )));
         }
         Ok(())
@@ -659,6 +671,17 @@ impl LoadBalancer {
     }
 }
 
+/// The targets a balancer should end up with: deduplicated, and trimmed to what the
+/// balancer type holds. Sorted, so that a cluster larger than the limit keeps the same
+/// targets from one reconciliation to the next instead of trading them back and forth.
+fn plan_targets(desired: &[String], max_targets: usize) -> Vec<&str> {
+    let mut planned = desired.iter().map(String::as_str).collect::<Vec<_>>();
+    planned.sort_unstable();
+    planned.dedup();
+    planned.truncate(max_targets);
+    planned
+}
+
 impl FromStr for LBAlgorithm {
     type Err = RobotLBError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -679,5 +702,40 @@ impl From<LBAlgorithm> for LoadBalancerAlgorithm {
             }
         };
         Self { r#type }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plan_targets;
+
+    #[test]
+    fn targets_are_sorted_and_deduplicated() {
+        let desired = vec![
+            "192.168.100.4".to_string(),
+            "192.168.100.2".to_string(),
+            "192.168.100.4".to_string(),
+        ];
+        assert_eq!(
+            plan_targets(&desired, 25),
+            vec!["192.168.100.2", "192.168.100.4"]
+        );
+    }
+
+    #[test]
+    fn targets_beyond_the_balancer_limit_are_dropped() {
+        let desired = (1..=30)
+            .map(|host| format!("192.168.100.{host:03}"))
+            .collect::<Vec<_>>();
+        let planned = plan_targets(&desired, 25);
+        assert_eq!(planned.len(), 25);
+        assert_eq!(planned[0], "192.168.100.001");
+        assert_eq!(planned[24], "192.168.100.025");
+    }
+
+    #[test]
+    fn a_plan_within_the_limit_keeps_every_target() {
+        let desired = vec!["192.168.100.2".to_string(), "192.168.100.3".to_string()];
+        assert_eq!(plan_targets(&desired, 25).len(), 2);
     }
 }
