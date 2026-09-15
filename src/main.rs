@@ -34,7 +34,7 @@ use kube::{
     Resource, ResourceExt,
 };
 use label_filter::LabelFilter;
-use lb::LoadBalancer;
+use lb::{LBService, LoadBalancer};
 use std::{collections::HashSet, str::FromStr, sync::Arc, time::Duration};
 
 pub mod config;
@@ -297,10 +297,34 @@ async fn get_nodes_by_selector(
     Ok(nodes)
 }
 
-/// Get every node of the cluster.
+/// Get every node of the cluster that may serve load balancer traffic.
 async fn get_all_nodes(context: &Arc<CurrentContext>) -> RobotLBResult<Vec<Node>> {
     let nodes_api = kube::Api::<Node>::all(context.client.clone());
-    Ok(nodes_api.list(&ListParams::default()).await?.items)
+    let nodes = nodes_api
+        .list(&ListParams::default())
+        .await?
+        .into_iter()
+        .filter(is_lb_eligible_node)
+        .collect::<Vec<_>>();
+    Ok(nodes)
+}
+
+/// Whether a node may be used as a load balancer target.
+/// Cordoned nodes are draining, and the exclusion label is how a cluster declares
+/// that a node must stay out of external load balancers.
+fn is_lb_eligible_node(node: &Node) -> bool {
+    if node
+        .labels()
+        .contains_key(consts::EXCLUDE_FROM_LB_LABEL_NAME)
+    {
+        tracing::debug!("Node {} is excluded from load balancers", node.name_any());
+        return false;
+    }
+    if node.spec.as_ref().and_then(|spec| spec.unschedulable) == Some(true) {
+        tracing::debug!("Node {} is unschedulable", node.name_any());
+        return false;
+    }
+    true
 }
 
 /// Whether the service asks for traffic to reach only the nodes that host its endpoints.
@@ -315,9 +339,8 @@ fn is_local_traffic_policy(svc: &Service) -> bool {
         == Some("Local")
 }
 
-/// Map the ports of a service onto load balancer services,
-/// as pairs of a listen port and the node port behind it.
-fn collect_lb_services(svc: &Service) -> Vec<(i32, i32)> {
+/// Map the ports of a service onto load balancer services.
+fn collect_lb_services(svc: &Service) -> Vec<LBService> {
     let mut services = Vec::new();
     for port in svc.spec.iter().flat_map(|spec| spec.ports.iter().flatten()) {
         let protocol = port.protocol.as_deref().unwrap_or("TCP");
@@ -333,7 +356,10 @@ fn collect_lb_services(svc: &Service) -> Vec<(i32, i32)> {
             );
             continue;
         };
-        services.push((port.port, node_port));
+        services.push(LBService {
+            listen_port: port.port,
+            target_port: node_port,
+        });
     }
     services
 }
@@ -375,8 +401,14 @@ pub async fn reconcile_load_balancer(
         }
     }
 
-    for (listen_port, node_port) in collect_lb_services(&svc) {
-        lb.add_service(listen_port, node_port);
+    for service in collect_lb_services(&svc) {
+        lb.add_service(service.listen_port, service.target_port);
+    }
+
+    if lb.services.is_empty() {
+        tracing::warn!(
+            "Service has no port that can be exposed. Leaving it without an external IP."
+        );
     }
 
     let svc_api = kube::Api::<Service>::namespaced(
@@ -411,7 +443,7 @@ pub async fn reconcile_load_balancer(
         }
     }
 
-    if !ingress.is_empty() {
+    if !ingress.is_empty() && !lb.services.is_empty() {
         svc_api
             .patch_status(
                 svc.name_any().as_str(),
@@ -441,12 +473,35 @@ fn on_error(_: Arc<Service>, error: &RobotLBError, _context: Arc<CurrentContext>
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_lb_services, is_local_traffic_policy};
-    use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
+    use super::{collect_lb_services, consts, is_lb_eligible_node, is_local_traffic_policy};
+    use k8s_openapi::{
+        api::core::v1::{Node, NodeSpec, Service, ServicePort, ServiceSpec},
+        apimachinery::pkg::apis::meta::v1::ObjectMeta,
+    };
+    use std::collections::BTreeMap;
 
     fn service(spec: ServiceSpec) -> Service {
         Service {
             spec: Some(spec),
+            ..Default::default()
+        }
+    }
+
+    fn node(labels: &[(&str, &str)], unschedulable: bool) -> Node {
+        Node {
+            metadata: ObjectMeta {
+                labels: Some(
+                    labels
+                        .iter()
+                        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                        .collect::<BTreeMap<_, _>>(),
+                ),
+                ..Default::default()
+            },
+            spec: Some(NodeSpec {
+                unschedulable: Some(unschedulable),
+                ..Default::default()
+            }),
             ..Default::default()
         }
     }
@@ -485,7 +540,10 @@ mod tests {
             }]),
             ..Default::default()
         });
-        assert_eq!(collect_lb_services(&svc), vec![(22, 30821)]);
+        let services = collect_lb_services(&svc);
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].listen_port, 22);
+        assert_eq!(services[0].target_port, 30821);
     }
 
     #[test]
@@ -498,7 +556,10 @@ mod tests {
             }]),
             ..Default::default()
         });
-        assert_eq!(collect_lb_services(&svc), vec![(80, 31571)]);
+        let services = collect_lb_services(&svc);
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].listen_port, 80);
+        assert_eq!(services[0].target_port, 31571);
     }
 
     #[test]
@@ -526,5 +587,26 @@ mod tests {
             ..Default::default()
         });
         assert!(collect_lb_services(&svc).is_empty());
+    }
+
+    #[test]
+    fn plain_node_is_eligible() {
+        assert!(is_lb_eligible_node(&node(
+            &[("kubernetes.io/hostname", "ws1")],
+            false
+        )));
+    }
+
+    #[test]
+    fn excluded_node_is_not_eligible() {
+        assert!(!is_lb_eligible_node(&node(
+            &[(consts::EXCLUDE_FROM_LB_LABEL_NAME, "")],
+            false
+        )));
+    }
+
+    #[test]
+    fn cordoned_node_is_not_eligible() {
+        assert!(!is_lb_eligible_node(&node(&[], true)));
     }
 }

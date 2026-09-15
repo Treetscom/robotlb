@@ -22,5 +22,10 @@ pub const DEFAULT_LB_LOCATION: &str = "hel1";
 pub const DEFAULT_LB_ALGORITHM: &str = "least-connections";
 pub const DEFAULT_LB_BALANCER_TYPE: &str = "lb11";
 
+/// Well-known Kubernetes label marking a node that must never be a load balancer target.
+/// kubeadm applies it to every control-plane node.
+pub const EXCLUDE_FROM_LB_LABEL_NAME: &str =
+    "node.kubernetes.io/exclude-from-external-load-balancers";
+
 pub const FINALIZER_NAME: &str = "robotlb/finalizer";
 pub const ROBOTLB_LB_CLASS: &str = "robotlb";
