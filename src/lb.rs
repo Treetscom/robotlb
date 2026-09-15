@@ -320,6 +320,19 @@ impl LoadBalancer {
             }
         }
 
+        let max_targets = hcloud_balancer.load_balancer_type.max_targets;
+        if i64::try_from(self.targets.len()).unwrap_or(i64::MAX) > max_targets {
+            tracing::warn!(
+                "Selected {} target(s), but a {} balancer holds at most {}. \
+                 Use a bigger balancer type or externalTrafficPolicy: Local.",
+                self.targets.len(),
+                hcloud_balancer.load_balancer_type.name,
+                max_targets,
+            );
+        }
+
+        let mut attempted = 0_usize;
+        let mut failed = 0_usize;
         for ip in &self.targets {
             if !hcloud_balancer
                 .targets
@@ -340,12 +353,22 @@ impl LoadBalancer {
                     },
                 )
                 .await;
+                attempted += 1;
                 // Hetzner rejects IPs outside the vSwitch subnet of the attached network,
                 // which must not keep the remaining nodes out of the load balancer.
                 if let Err(error) = added {
-                    tracing::error!("Cannot add target {ip}: {error}");
+                    failed += 1;
+                    tracing::warn!("Cannot add target {ip}: {error}");
                 }
             }
+        }
+        // Losing every single target is a failure of the whole reconciliation, not a
+        // rejected node: the service must not be reported as ready in that case.
+        if attempted > 0 && attempted == failed {
+            return Err(RobotLBError::HCloudError(format!(
+                "None of the {attempted} target(s) could be added to load balancer {}",
+                self.name
+            )));
         }
         Ok(())
     }
