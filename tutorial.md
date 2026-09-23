@@ -347,7 +347,7 @@ After you have chosen the subnet, Hetzner will give you the gateway address that
 Let's log in to our robot servers by their public IPs and set up private networking interfaces. I won't be using the `ip` command as suggested in a hint by Hetzner, instead, I will be using `netplan` to make my interface setup persistent.
 
 ```bash
-ssh intree-prod-kube-agent-1
+ssh treets-prod-kube-agent-1
 vim /etc/netplan/01-netcfg.yaml
 ```
 
@@ -447,7 +447,7 @@ Once the cluster is ready, we can deploy our RobotLB. Before that, create an hcl
 
 ```bash
 helm install robotlb  \
-    oci://ghcr.io/intreecom/charts/robotlb \
+    oci://ghcr.io/treetscom/charts/robotlb \
     --set envs.ROBOTLB_HCLOUD_TOKEN="<hcloud token>" \
     --namespace robotlb \
     --create-namespace \

@@ -23,10 +23,10 @@ If you meet all the requirements, you can deploy `robotlb`.
 The recommended way to deploy this operator is using the Helm chart.
 
 ```bash
-helm show values oci://ghcr.io/intreecom/charts/robotlb > values.yaml
+helm show values oci://ghcr.io/treetscom/charts/robotlb > values.yaml
 # Edit values.yaml to suit your needs
 # Set `envs.ROBOTLB_HCLOUD_TOKEN`.
-helm install robotlb oci://ghcr.io/intreecom/charts/robotlb -f values.yaml
+helm install robotlb oci://ghcr.io/treetscom/charts/robotlb -f values.yaml
 ```
 
 After the chart is installed, you should be able to create `LoadBalancer` services.
@@ -142,4 +142,4 @@ spec:
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=Intreecom/robotlb&type=Date)](https://star-history.com/#Intreecom/robotlb&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=Treetscom/robotlb&type=Date)](https://star-history.com/#Treetscom/robotlb&Date)
