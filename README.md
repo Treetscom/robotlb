@@ -52,7 +52,6 @@ Every port of the service needs an allocated `nodePort`. A Hetzner load balancer
 
 > Earlier releases treated every service as if it had the `Local` policy. Services that leave `externalTrafficPolicy` unset therefore get the full node list on upgrade, which changes the targets of their existing balancers.
 
-
 ## Configuration
 
 This project has two places for configuration: environment variables and service annotations.
@@ -63,7 +62,7 @@ Environment variables are mainly used to override default arguments and provide 
 
 Here’s a complete list of parameters for the operator's binary:
 
-```
+```text
 Usage: robotlb [OPTIONS] --hcloud-token <HCLOUD_TOKEN>
 
 Options:
@@ -97,9 +96,7 @@ Options:
           Print help
 ```
 
-
 ### Service annotations
-
 
 ```yaml
 apiVersion: v1
