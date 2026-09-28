@@ -37,9 +37,7 @@ pub fn check(service: &Service) -> bool {
         .metadata
         .finalizers
         .as_ref()
-        .map_or(false, |finalizers| {
-            finalizers.contains(&consts::FINALIZER_NAME.to_string())
-        })
+        .is_some_and(|finalizers| finalizers.contains(&consts::FINALIZER_NAME.to_string()))
 }
 
 /// Remove finalizer from the service.
