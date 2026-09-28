@@ -35,7 +35,20 @@ After the chart is installed, you should be able to create `LoadBalancer` servic
 
 The operator listens to the Kubernetes API for services of type `LoadBalancer` and creates Hetzner load balancers that point to nodes based on `node-ip`.
 
-Nodes are selected based on where the service's target pods are deployed, which is determined by searching for pods with the service's selector. This behavior can be configured.
+Target nodes are selected according to the service's `externalTrafficPolicy`:
+
+- `Cluster`, the Kubernetes default: every node of the cluster becomes a target, since kube-proxy forwards the traffic to a node that hosts a pod. Cordoned and not-ready nodes are left out, as they would only take up target slots.
+- `Local`: only the nodes where the service's target pods run, found through the service selector, or through the service's `EndpointSlice` resources when it has no selector.
+
+Nodes labelled `node.kubernetes.io/exclude-from-external-load-balancers`, which kubeadm puts on control-plane nodes, stay out of every balancer under either policy.
+
+Setting `ROBOTLB_DYNAMIC_NODE_SELECTOR` to `false` replaces both with the node selector from the `robotlb/node-selector` annotation.
+
+A balancer type caps how many targets it holds: `lb11`, the default type, holds 25. When more nodes are selected than the type holds, the extra ones are dropped in a stable order and a warning names the limit. Pick a bigger type through `ROBOTLB_DEFAULT_LB_TYPE` or the `robotlb/balancer-type` annotation to use the whole cluster.
+
+Every port of the service needs an allocated `nodePort`. A Hetzner load balancer forwards traffic to the IP of a node, so a port is reachable only through its `nodePort`: ports without one are skipped, and `allocateLoadBalancerNodePorts: false` is not supported. When no port of a service can be exposed, no balancer is created for it, and a service that already advertises an external IP loses it.
+
+> Earlier releases treated every service as if it had the `Local` policy. Services that leave `externalTrafficPolicy` unset therefore get the full node list on upgrade, which changes the targets of their existing balancers.
 
 
 ## Configuration
