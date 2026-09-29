@@ -1,4 +1,7 @@
-use k8s_openapi::{api::core::v1::Service, serde_json::json};
+use k8s_openapi::{
+    api::core::v1::Service,
+    serde_json::{json, Value},
+};
 use kube::{
     api::{Patch, PatchParams},
     Api, Client, ResourceExt,
@@ -16,15 +19,10 @@ pub async fn add(client: Client, svc: &Service) -> RobotLBResult<()> {
         client,
         svc.namespace().ok_or(RobotLBError::SkipService)?.as_str(),
     );
-    let patch = json!({
-        "metadata": {
-            "finalizers": [consts::FINALIZER_NAME]
-        }
-    });
     api.patch(
         svc.name_any().as_str(),
         &PatchParams::default(),
-        &Patch::Merge(patch),
+        &add_patch(),
     )
     .await?;
     Ok(())
@@ -51,21 +49,55 @@ pub async fn remove(client: Client, svc: &Service) -> RobotLBResult<()> {
         client,
         svc.namespace().ok_or(RobotLBError::SkipService)?.as_str(),
     );
-    let finalizers = svc
-        .finalizers()
-        .iter()
-        .filter(|item| item.as_str() != consts::FINALIZER_NAME)
-        .collect::<Vec<_>>();
-    let patch = json!({
-        "metadata": {
-            "finalizers": finalizers
-        }
-    });
     api.patch(
         svc.name_any().as_str(),
         &PatchParams::default(),
-        &Patch::Merge(patch),
+        &remove_patch(),
     )
     .await?;
     Ok(())
+}
+
+// `metadata.finalizers` is merged by value in a strategic merge patch, so these
+// touch only robotlb's own entry, whatever other controllers add or remove meanwhile.
+fn add_patch() -> Patch<Value> {
+    Patch::Strategic(json!({
+        "metadata": {
+            "finalizers": [consts::FINALIZER_NAME]
+        }
+    }))
+}
+
+fn remove_patch() -> Patch<Value> {
+    Patch::Strategic(json!({
+        "metadata": {
+            "$deleteFromPrimitiveList/finalizers": [consts::FINALIZER_NAME]
+        }
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{add_patch, remove_patch};
+    use crate::consts;
+    use k8s_openapi::serde_json::json;
+    use kube::api::Patch;
+
+    #[test]
+    fn adding_merges_into_the_existing_list() {
+        assert_eq!(
+            add_patch(),
+            Patch::Strategic(json!({"metadata": {"finalizers": [consts::FINALIZER_NAME]}}))
+        );
+    }
+
+    #[test]
+    fn removing_deletes_only_our_finalizer() {
+        assert_eq!(
+            remove_patch(),
+            Patch::Strategic(json!({
+                "metadata": {"$deleteFromPrimitiveList/finalizers": [consts::FINALIZER_NAME]}
+            }))
+        );
+    }
 }
