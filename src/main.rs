@@ -100,7 +100,7 @@ async fn main() -> RobotLBResult<()> {
                     error @ RobotLBError::RateLimited(_),
                     service,
                 )) => {
-                    tracing::debug!("Service {service}: {error}");
+                    tracing::info!("Service {service}: {error}");
                 }
                 Err(controller::Error::ReconcilerFailed(error, service)) => {
                     tracing::error!(
@@ -155,13 +155,10 @@ pub async fn reconcile_service(
     result
 }
 
-/// Skipped services are every service robotlb does not own, and a gated one has not
-/// called the API at all, so neither has a failure to show.
+/// Skipped services are every service robotlb does not own. A service waiting at the
+/// rate limit gate still gets an event each time it wakes up to a closed gate.
 const fn publishes_event(error: &RobotLBError) -> bool {
-    !matches!(
-        error,
-        RobotLBError::SkipService | RobotLBError::RateLimited(_)
-    )
+    !matches!(error, RobotLBError::SkipService)
 }
 
 /// Put the error on the service as a warning event, where `kubectl describe` shows it.
@@ -890,10 +887,12 @@ mod tests {
     }
 
     #[test]
-    fn only_real_failures_publish_an_event() {
+    fn every_failure_except_a_skip_publishes_an_event() {
         use crate::error::RobotLBError;
         assert!(!publishes_event(&RobotLBError::SkipService));
-        assert!(!publishes_event(&RobotLBError::RateLimited(
+        // Jitter wakes the same service first after every pause, so the others only
+        // ever see the closed gate, and without an event of their own they go silent.
+        assert!(publishes_event(&RobotLBError::RateLimited(
             std::time::Duration::from_secs(1)
         )));
         assert!(publishes_event(&RobotLBError::from(hcloud::apis::Error::<
