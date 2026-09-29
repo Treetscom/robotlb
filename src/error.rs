@@ -40,6 +40,10 @@ pub enum RobotLBError {
         label = crate::consts::LB_OWNER_LABEL
     )]
     NoNodesToRecogniseBalancer(String),
+    #[error(
+        "The robotlb/balancer annotation needs a name Hetzner accepts: 1 to 128 characters on one line, without whitespace at the start or end. Got {0:?}"
+    )]
+    InvalidBalancerName(String),
     #[error("More than one load balancer matches {0}")]
     AmbiguousBalancer(String),
     #[error("Hetzner Cloud API rate limit reached, the pause ends in {}s", .0.as_millis().div_ceil(1000))]
@@ -146,6 +150,7 @@ impl RobotLBError {
             | Self::UnrecognisedBalancer { .. }
             | Self::NoNodesToRecogniseBalancer(_)
             | Self::AmbiguousBalancer(_)
+            | Self::InvalidBalancerName(_)
             | Self::RateLimited(_) => false,
         }
     }
@@ -308,5 +313,13 @@ mod tests {
         let error = RobotLBError::NoNodesToRecogniseBalancer("web".to_string());
         assert!(!error.is_rate_limited());
         assert!(!error.to_string().contains("add-label"));
+    }
+
+    // Event notes are cut to 1024 bytes, and the name may be far longer.
+    #[test]
+    fn an_invalid_name_is_reported_after_the_rule() {
+        let name = "a".repeat(2000);
+        let message = RobotLBError::InvalidBalancerName(name.clone()).to_string();
+        assert!(message.find("128 characters").unwrap() < message.find(&name).unwrap());
     }
 }
