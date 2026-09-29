@@ -7,6 +7,12 @@ pub struct OperatorConfig {
     #[arg(short = 't', long, env = "ROBOTLB_HCLOUD_TOKEN")]
     pub hcloud_token: String,
 
+    /// Name of the cluster, put in front of default balancer names so that clusters
+    /// sharing a Hetzner project do not pick the same ones. A DNS label: lowercase
+    /// letters, digits and `-`, at most 63 characters.
+    #[arg(long, env = "ROBOTLB_CLUSTER_NAME", value_parser = crate::lb::parse_cluster_name)]
+    pub cluster_name: Option<String>,
+
     /// Default network to use for load balancers.
     /// If not set, then only network from the service annotation will be used.
     #[arg(long, env = "ROBOTLB_DEFAULT_NETWORK", default_value = None)]
