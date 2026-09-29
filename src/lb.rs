@@ -4,8 +4,8 @@ use hcloud::{
         load_balancers_api::{
             AddServiceParams, AddTargetParams, AttachLoadBalancerToNetworkParams,
             ChangeAlgorithmParams, ChangeTypeOfLoadBalancerParams, DeleteLoadBalancerParams,
-            DeleteServiceParams, DetachLoadBalancerFromNetworkParams, ListLoadBalancersParams,
-            RemoveTargetParams, UpdateServiceParams,
+            DeleteServiceParams, DetachLoadBalancerFromNetworkParams, GetLoadBalancerParams,
+            ListLoadBalancersParams, RemoveTargetParams, UpdateServiceParams,
         },
         networks_api::ListNetworksParams,
     },
@@ -517,11 +517,29 @@ impl LoadBalancer {
         Ok(())
     }
 
-    /// Cleanup the load balancer.
-    /// This method will remove all the services and targets from the
-    /// load balancer.
-    pub async fn cleanup(&self) -> RobotLBResult<()> {
-        let Some(hcloud_balancer) = self.get_hcloud_lb().await? else {
+    /// Delete the balancer of the service. The recorded ID is preferred over the name,
+    /// which may have changed since the balancer was found; the name is still tried
+    /// when no balancer has the recorded ID.
+    pub async fn cleanup(&self, recorded_id: Option<i64>) -> RobotLBResult<()> {
+        let mut hcloud_balancer = match recorded_id {
+            Some(id) => {
+                match hcloud::apis::load_balancers_api::get_load_balancer(
+                    &self.hcloud_config,
+                    GetLoadBalancerParams { id },
+                )
+                .await
+                {
+                    Ok(response) => Some(*response.load_balancer),
+                    Err(error) if crate::error::is_not_found_response(&error) => None,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            None => None,
+        };
+        if falls_back_to_name(recorded_id, hcloud_balancer.is_some()) {
+            hcloud_balancer = self.get_hcloud_lb().await?;
+        }
+        let Some(hcloud_balancer) = hcloud_balancer else {
             return Ok(());
         };
         for service in &hcloud_balancer.services {
@@ -668,6 +686,10 @@ impl LoadBalancer {
     }
 }
 
+const fn falls_back_to_name(recorded_id: Option<i64>, found_by_id: bool) -> bool {
+    recorded_id.is_none() || !found_by_id
+}
+
 /// The targets a balancer should end up with: deduplicated, and trimmed to what the
 /// balancer type holds. Sorted, so that a cluster larger than the limit keeps the same
 /// targets from one reconciliation to the next instead of trading them back and forth.
@@ -704,7 +726,7 @@ impl From<LBAlgorithm> for LoadBalancerAlgorithm {
 
 #[cfg(test)]
 mod tests {
-    use super::plan_targets;
+    use super::{falls_back_to_name, plan_targets};
 
     #[test]
     fn targets_are_sorted_and_deduplicated() {
@@ -734,5 +756,14 @@ mod tests {
     fn a_plan_within_the_limit_keeps_every_target() {
         let desired = vec!["192.168.100.2".to_string(), "192.168.100.3".to_string()];
         assert_eq!(plan_targets(&desired, 25).len(), 2);
+    }
+
+    // A recorded ID goes stale when a reconcile creates a new balancer and fails
+    // before recording it, and the balancer under the name must still be found.
+    #[test]
+    fn a_missing_recorded_balancer_falls_back_to_the_name() {
+        assert!(falls_back_to_name(Some(4711), false));
+        assert!(!falls_back_to_name(Some(4711), true));
+        assert!(falls_back_to_name(None, false));
     }
 }
