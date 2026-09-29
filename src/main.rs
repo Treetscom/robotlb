@@ -895,6 +895,20 @@ mod tests {
         assert!(publishes_event(&RobotLBError::HCloudError(
             "boom".to_string()
         )));
+        assert!(publishes_event(&RobotLBError::UnrecognisedBalancer {
+            name: "web".to_string(),
+            uid: "uid-1".to_string(),
+        }));
+        assert!(publishes_event(&RobotLBError::ForeignBalancer {
+            name: "web".to_string(),
+            owner: "uid-2".to_string(),
+        }));
+        assert!(publishes_event(&RobotLBError::NoNodesToRecogniseBalancer(
+            "web".to_string()
+        )));
+        assert!(publishes_event(&RobotLBError::AmbiguousBalancer(
+            "web".to_string()
+        )));
     }
 
     fn owned_service(type_: &str, class: Option<&str>, deleting: bool) -> Service {
