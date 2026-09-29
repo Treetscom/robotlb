@@ -22,6 +22,10 @@ pub enum RobotLBError {
     UnknownLBAlgorithm,
     #[error("Cannot get target nodes, because the service has no selector")]
     ServiceWithoutSelector,
+    #[error(
+        "No TCP port of the service has a nodePort, so the load balancer has nothing to forward"
+    )]
+    NoExposablePorts,
     #[error("Hetzner Cloud API rate limit reached, the pause ends in {}s", .0.as_millis().div_ceil(1000))]
     RateLimited(std::time::Duration),
 
@@ -116,9 +120,15 @@ impl RobotLBError {
             | Self::KubeError(_)
             | Self::UnknownLBAlgorithm
             | Self::ServiceWithoutSelector
+            | Self::NoExposablePorts
             | Self::RateLimited(_) => false,
         }
     }
+}
+
+#[must_use]
+pub fn is_not_found_response<T>(error: &hcloud::apis::Error<T>) -> bool {
+    matches!(error, hcloud::apis::Error::ResponseError(response) if response.status.as_u16() == 404)
 }
 
 /// Whether Hetzner answered 429 because the project ran out of API requests.
@@ -168,7 +178,7 @@ pub fn redact(message: &str, token: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{describe, is_rate_limit_response, redact, RobotLBError};
+    use super::{describe, is_not_found_response, is_rate_limit_response, redact, RobotLBError};
     use hcloud::apis::{load_balancers_api::ListLoadBalancersError, Error, ResponseContent};
 
     const TOKEN: &str = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ01";
@@ -233,6 +243,12 @@ mod tests {
     fn a_429_is_a_rate_limit() {
         let error = RobotLBError::from(response_error(429, ""));
         assert!(error.is_rate_limited());
+    }
+
+    #[test]
+    fn only_a_404_response_is_not_found() {
+        assert!(is_not_found_response(&response_error(404, "")));
+        assert!(!is_not_found_response(&response_error(429, "")));
     }
 
     #[test]
