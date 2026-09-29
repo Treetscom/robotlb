@@ -26,6 +26,22 @@ pub enum RobotLBError {
         "No TCP port of the service has a nodePort, so the load balancer has nothing to forward"
     )]
     NoExposablePorts,
+    #[error(
+        "Load balancer '{name}' is labelled for the service with UID {owner}, so robotlb leaves it alone. Set another name through the robotlb/balancer annotation"
+    )]
+    ForeignBalancer { name: String, owner: String },
+    #[error(
+        "Load balancer '{name}' has no {label} label and does not look like a balancer robotlb made for this service (IP targets only, at least one of them a node of the service), so robotlb leaves it alone. If it belongs to this service: hcloud load-balancer add-label '{name}' {label}={uid}",
+        label = crate::consts::LB_OWNER_LABEL
+    )]
+    UnrecognisedBalancer { name: String, uid: String },
+    #[error(
+        "Load balancer '{0}' has no {label} label, and whether it belongs to this service cannot be told before the service has target nodes",
+        label = crate::consts::LB_OWNER_LABEL
+    )]
+    NoNodesToRecogniseBalancer(String),
+    #[error("More than one load balancer matches {0}")]
+    AmbiguousBalancer(String),
     #[error("Hetzner Cloud API rate limit reached, the pause ends in {}s", .0.as_millis().div_ceil(1000))]
     RateLimited(std::time::Duration),
 
@@ -81,6 +97,10 @@ pub enum RobotLBError {
     HcloudLBChangeAlgorithm(
         #[from] hcloud::apis::Error<hcloud::apis::load_balancers_api::ChangeAlgorithmError>,
     ),
+    #[error("Cannot label load balancer. Reason: {}", describe(.0))]
+    HcloudLBReplaceError(
+        #[from] hcloud::apis::Error<hcloud::apis::load_balancers_api::ReplaceLoadBalancerError>,
+    ),
     #[error("Cannot list networks. Reason: {}", describe(.0))]
     HcloudListNetworksError(
         #[from] hcloud::apis::Error<hcloud::apis::networks_api::ListNetworksError>,
@@ -109,6 +129,7 @@ impl RobotLBError {
             Self::HcloudLBUpdateServiceError(error) => is_rate_limit_response(error),
             Self::HcloudLBChangeType(error) => is_rate_limit_response(error),
             Self::HcloudLBChangeAlgorithm(error) => is_rate_limit_response(error),
+            Self::HcloudLBReplaceError(error) => is_rate_limit_response(error),
             Self::HcloudListNetworksError(error) => is_rate_limit_response(error),
             Self::HcloudListLoadBalancersError(error) => is_rate_limit_response(error),
             Self::InvalidNodeFilter(_)
@@ -121,14 +142,13 @@ impl RobotLBError {
             | Self::UnknownLBAlgorithm
             | Self::ServiceWithoutSelector
             | Self::NoExposablePorts
+            | Self::ForeignBalancer { .. }
+            | Self::UnrecognisedBalancer { .. }
+            | Self::NoNodesToRecogniseBalancer(_)
+            | Self::AmbiguousBalancer(_)
             | Self::RateLimited(_) => false,
         }
     }
-}
-
-#[must_use]
-pub fn is_not_found_response<T>(error: &hcloud::apis::Error<T>) -> bool {
-    matches!(error, hcloud::apis::Error::ResponseError(response) if response.status.as_u16() == 404)
 }
 
 /// Whether Hetzner answered 429 because the project ran out of API requests.
@@ -178,7 +198,7 @@ pub fn redact(message: &str, token: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{describe, is_not_found_response, is_rate_limit_response, redact, RobotLBError};
+    use super::{describe, is_rate_limit_response, redact, RobotLBError};
     use hcloud::apis::{load_balancers_api::ListLoadBalancersError, Error, ResponseContent};
 
     const TOKEN: &str = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ01";
@@ -246,12 +266,6 @@ mod tests {
     }
 
     #[test]
-    fn only_a_404_response_is_not_found() {
-        assert!(is_not_found_response(&response_error(404, "")));
-        assert!(!is_not_found_response(&response_error(429, "")));
-    }
-
-    #[test]
     fn only_a_429_response_is_a_rate_limit() {
         assert!(is_rate_limit_response(&response_error(429, "")));
         // Hetzner answers 422 for a target outside the vSwitch subnet.
@@ -262,5 +276,37 @@ mod tests {
     fn other_statuses_are_not_a_rate_limit() {
         assert!(!RobotLBError::from(response_error(500, "")).is_rate_limited());
         assert!(!RobotLBError::SkipService.is_rate_limited());
+        assert!(!RobotLBError::AmbiguousBalancer("web".to_string()).is_rate_limited());
+    }
+
+    #[test]
+    fn an_unrecognised_balancer_names_the_handover_command() {
+        let error = RobotLBError::UnrecognisedBalancer {
+            name: "custom name".to_string(),
+            uid: "uid-1".to_string(),
+        };
+        assert!(!error.is_rate_limited());
+        assert!(error
+            .to_string()
+            .contains("hcloud load-balancer add-label 'custom name' robotlb/service-uid=uid-1"));
+    }
+
+    // Relabelling would take the balancer from a service that may still use it.
+    #[test]
+    fn a_balancer_of_another_service_names_its_owner_and_no_handover() {
+        let error = RobotLBError::ForeignBalancer {
+            name: "web".to_string(),
+            owner: "uid-2".to_string(),
+        };
+        assert!(!error.is_rate_limited());
+        assert!(error.to_string().contains("uid-2"));
+        assert!(!error.to_string().contains("add-label"));
+    }
+
+    #[test]
+    fn a_service_without_nodes_is_told_to_wait() {
+        let error = RobotLBError::NoNodesToRecogniseBalancer("web".to_string());
+        assert!(!error.is_rate_limited());
+        assert!(!error.to_string().contains("add-label"));
     }
 }

@@ -1,6 +1,6 @@
 pub const LB_NAME_LABEL_NAME: &str = "robotlb/balancer";
-/// Written by robotlb: the Hetzner ID of the balancer it created for the service.
-pub const LB_ID_ANN_NAME: &str = "robotlb/balancer-id";
+/// Hetzner label on every balancer robotlb manages: the UID of the service it serves.
+pub const LB_OWNER_LABEL: &str = "robotlb/service-uid";
 pub const LB_NODE_SELECTOR: &str = "robotlb/node-selector";
 pub const LB_NODE_IP_LABEL_NAME: &str = "robotlb/node-ip";
 
