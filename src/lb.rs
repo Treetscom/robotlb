@@ -569,7 +569,7 @@ impl LoadBalancer {
         if let Some(balancer) = single(labelled, &selector)? {
             return Ok(Some(balancer));
         }
-        for (name, legacy) in candidate_names(purpose, &self.name, self.legacy_name.as_deref()) {
+        for (name, legacy) in candidate_names(purpose, &self.name, self.legacy_name.as_deref())? {
             let named = self
                 .list_hcloud_lbs(ListLoadBalancersParams {
                     name: Some(name.to_string()),
@@ -710,6 +710,21 @@ fn default_name(service: &str, namespace: &str) -> String {
     format!("{service}.{namespace}")
 }
 
+/// Hetzner checks a name against `^\S(.*\S)?$` and 1 to 128 characters and answers
+/// a create with a name that fails with 422. The pattern comes from its API
+/// schema, where regexes are ECMA-262: `.` does not match a line terminator.
+fn validate_name(name: &str) -> RobotLBResult<()> {
+    // ECMA `\s` differs from Rust whitespace in U+FEFF (in) and U+0085 (out).
+    let not_space = |c: char| c != '\u{feff}' && (!c.is_whitespace() || c == '\u{85}');
+    let edges_ok = name.starts_with(not_space) && name.ends_with(not_space);
+    let one_line = !name.contains(['\n', '\r', '\u{2028}', '\u{2029}']);
+    if edges_ok && one_line && name.chars().count() <= 128 {
+        Ok(())
+    } else {
+        Err(RobotLBError::InvalidBalancerName(name.to_string()))
+    }
+}
+
 fn owner_selector(uid: &str) -> String {
     format!("{}={uid}", consts::LB_OWNER_LABEL)
 }
@@ -733,15 +748,16 @@ fn candidate_names<'a>(
     purpose: Purpose,
     name: &'a str,
     legacy_name: Option<&'a str>,
-) -> Vec<(&'a str, bool)> {
+) -> RobotLBResult<Vec<(&'a str, bool)>> {
     if purpose == Purpose::Release {
-        return vec![];
+        return Ok(vec![]);
     }
-    legacy_name
+    validate_name(name)?;
+    Ok(legacy_name
         .map(|legacy| (legacy, true))
         .into_iter()
         .chain([(name, false)])
-        .collect()
+        .collect())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -841,7 +857,7 @@ impl From<LBAlgorithm> for LoadBalancerAlgorithm {
 mod tests {
     use super::{
         candidate_names, decide, default_name, owner_labels, owner_selector, plan_targets, single,
-        Decision, LoadBalancer, Purpose,
+        validate_name, Decision, LoadBalancer, Purpose,
     };
     use crate::{consts, error::RobotLBError};
     use hcloud::apis::configuration::Configuration as HcloudConfig;
@@ -996,15 +1012,29 @@ mod tests {
 
     #[test]
     fn a_release_never_looks_a_balancer_up_by_name() {
-        assert!(candidate_names(Purpose::Release, "web.shop", Some("web")).is_empty());
+        assert!(candidate_names(Purpose::Release, "web.shop", Some("web"))
+            .unwrap()
+            .is_empty());
         assert_eq!(
-            candidate_names(Purpose::Reconcile, "web.shop", Some("web")),
+            candidate_names(Purpose::Reconcile, "web.shop", Some("web")).unwrap(),
             vec![("web", true), ("web.shop", false)]
         );
         assert_eq!(
-            candidate_names(Purpose::Reconcile, "custom", None),
+            candidate_names(Purpose::Reconcile, "custom", None).unwrap(),
             vec![("custom", false)]
         );
+    }
+
+    #[test]
+    fn an_invalid_name_is_never_looked_up_or_created() {
+        assert!(matches!(
+            candidate_names(Purpose::Reconcile, " web", None),
+            Err(RobotLBError::InvalidBalancerName(_))
+        ));
+        // A release carries no name and must not fail on it.
+        assert!(candidate_names(Purpose::Release, "", None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1030,5 +1060,66 @@ mod tests {
         };
         let lb = LoadBalancer::for_release(&svc, HcloudConfig::default()).unwrap();
         assert_eq!(lb.service_uid, "uid-1");
+    }
+
+    #[test]
+    fn a_name_hetzner_rejects_is_invalid() {
+        for name in [
+            "",
+            " web",
+            "web ",
+            "\tweb",
+            "web\n",
+            "a\nb",
+            "\u{feff}web",
+            &"a".repeat(129),
+        ] {
+            assert!(
+                matches!(
+                    validate_name(name),
+                    Err(RobotLBError::InvalidBalancerName(_))
+                ),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_hetzner_takes_is_valid() {
+        for name in [
+            "w",
+            "custom name",
+            "web\u{85}",
+            &"a".repeat(128),
+            &"ä".repeat(128),
+        ] {
+            assert!(validate_name(name).is_ok(), "{name:?}");
+        }
+    }
+
+    // The name only matters when no balancer carries the service UID, so a labelled
+    // balancer keeps being managed whatever the annotation says.
+    #[tokio::test]
+    async fn an_invalid_balancer_name_does_not_stop_a_service_from_loading() {
+        use clap::Parser;
+        let config =
+            crate::config::OperatorConfig::try_parse_from(["robotlb", "--hcloud-token", "t"])
+                .unwrap();
+        let client =
+            kube::Client::try_from(kube::Config::new("http://127.0.0.1:1".parse().unwrap()))
+                .unwrap();
+        let context = crate::CurrentContext::new(client, config, HcloudConfig::default());
+        let svc = Service {
+            metadata: ObjectMeta {
+                uid: Some("uid-1".to_string()),
+                annotations: Some(
+                    [(consts::LB_NAME_LABEL_NAME.to_string(), " web".to_string())].into(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let lb = LoadBalancer::try_from_svc(&svc, &context).unwrap();
+        assert_eq!(lb.name, " web");
     }
 }
