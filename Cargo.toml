@@ -5,19 +5,19 @@ edition = "2021"
 readme = "README.md"
 
 [dependencies]
-clap = { version = "4.5.21", features = ["derive", "env"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
 dotenvy = "0.15.7"
-futures = "0.3.31"
+futures = "0.3.34"
 hcloud = "0.21.0"
 k8s-openapi = { version = "0.23.0", features = ["v1_31"] }
 kube = { version = "0.96.0", features = ["runtime"] }
-thiserror = "2.0.3"
-tokio = { version = "1.43.1", features = ["macros", "rt-multi-thread"] }
-tracing = "0.1.40"
-tracing-subscriber = "0.3.18"
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.6"
+tikv-jemallocator = "0.7.0"
 
 [profile.release]
 codegen-units = 1
