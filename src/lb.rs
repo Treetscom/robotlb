@@ -553,9 +553,7 @@ impl LoadBalancer {
         Ok(())
     }
 
-    /// Cleanup the load balancer.
-    /// This method will remove all the services and targets from the
-    /// load balancer.
+    /// Delete the balancer of the service, found by its name.
     pub async fn cleanup(&self) -> RobotLBResult<()> {
         let Some(hcloud_balancer) = self.get_hcloud_lb().await? else {
             return Ok(());
