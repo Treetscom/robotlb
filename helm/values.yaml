@@ -28,7 +28,7 @@ serviceAccount:
   # If not set and create is true, a name is generated using the fullname template
   name: ""
   # This is a list of cluster permissions to apply to the service account.
-  # By default it grants all permissions.
+  # The default is what robotlb needs; a custom list replaces it entirely.
   permissions:
   - apiGroups: [""]
     resources: [services, services/status]
