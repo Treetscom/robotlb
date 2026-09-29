@@ -12,7 +12,7 @@ pub struct OperatorConfig {
     #[arg(long, env = "ROBOTLB_DEFAULT_NETWORK", default_value = None)]
     pub default_network: Option<String>,
 
-    /// If enabled, the operator will try to find target nodes based on where the target pods are actually deployed.
+    /// If enabled, the operator will try to find target nodes based on the service's traffic policy, and under `Local` on the nodes serving the service's endpoints.
     /// If disabled, the operator will try to find target nodes based on the node selector.
     #[arg(long, env = "ROBOTLB_DYNAMIC_NODE_SELECTOR", default_value = "true")]
     pub dynamic_node_selector: bool,
