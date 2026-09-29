@@ -132,9 +132,13 @@ impl LoadBalancer {
 
         let annotated_name = svc.annotations().get(consts::LB_NAME_LABEL_NAME);
         let legacy_name = annotated_name.is_none().then(|| svc.name_any());
-        let name = annotated_name
-            .cloned()
-            .unwrap_or_else(|| default_name(&svc.name_any(), &svc.namespace().unwrap_or_default()));
+        let name = annotated_name.cloned().unwrap_or_else(|| {
+            default_name(
+                context.config.cluster_name.as_deref(),
+                &svc.name_any(),
+                &svc.namespace().unwrap_or_default(),
+            )
+        });
         // The API server sets the UID on every object it stores.
         let service_uid = svc.uid().ok_or(RobotLBError::SkipService)?;
 
@@ -704,10 +708,31 @@ impl LoadBalancer {
     }
 }
 
-/// Service names and namespaces are DNS labels: at most 63 characters and no dots,
-/// so the result fits the 128 Hetzner allows and cannot be split two ways.
-fn default_name(service: &str, namespace: &str) -> String {
-    format!("{service}.{namespace}")
+/// Service names, namespaces and the cluster name are DNS labels: at most 63
+/// characters and no dots, so the name cannot be split two ways. Without a cluster
+/// name it fits the 128 Hetzner allows. A longer one is cut and ends in a 64-bit
+/// hash of the whole name, so long names that share the kept part still differ.
+fn default_name(cluster: Option<&str>, service: &str, namespace: &str) -> String {
+    let name = cluster.map_or_else(
+        || format!("{service}.{namespace}"),
+        |cluster| format!("{cluster}.{service}.{namespace}"),
+    );
+    if name.len() <= MAX_NAME_LEN {
+        return name;
+    }
+    // DNS labels are ASCII, so the cut falls on a character boundary.
+    let hash = format!("-{:016x}", fnv1a64(&name));
+    format!("{}{hash}", &name[..MAX_NAME_LEN - hash.len()])
+}
+
+const MAX_NAME_LEN: usize = 128;
+
+/// FNV-1a, 64 bit: the hash ends up in names balancers are looked up by, so it has
+/// to stay the same across releases, which std's hashers do not promise.
+fn fnv1a64(value: &str) -> u64 {
+    value.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 /// Hetzner checks a name against `^\S(.*\S)?$` and 1 to 128 characters and answers
@@ -718,10 +743,25 @@ fn validate_name(name: &str) -> RobotLBResult<()> {
     let not_space = |c: char| c != '\u{feff}' && (!c.is_whitespace() || c == '\u{85}');
     let edges_ok = name.starts_with(not_space) && name.ends_with(not_space);
     let one_line = !name.contains(['\n', '\r', '\u{2028}', '\u{2029}']);
-    if edges_ok && one_line && name.chars().count() <= 128 {
+    if edges_ok && one_line && name.chars().count() <= MAX_NAME_LEN {
         Ok(())
     } else {
         Err(RobotLBError::InvalidBalancerName(name.to_string()))
+    }
+}
+
+/// Without dots, the cluster name cannot end in the middle of a `<cluster>.<service>`
+/// prefix of another cluster.
+pub fn parse_cluster_name(value: &str) -> Result<String, String> {
+    let alphanumeric = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let valid = (1..=63).contains(&value.len())
+        && value.chars().all(|c| alphanumeric(c) || c == '-')
+        && value.starts_with(alphanumeric)
+        && value.ends_with(alphanumeric);
+    if valid {
+        Ok(value.to_string())
+    } else {
+        Err("must be a DNS label: 1 to 63 lowercase letters, digits or '-', starting and ending with a letter or digit".to_string())
     }
 }
 
@@ -856,8 +896,8 @@ impl From<LBAlgorithm> for LoadBalancerAlgorithm {
 #[cfg(test)]
 mod tests {
     use super::{
-        candidate_names, decide, default_name, owner_labels, owner_selector, plan_targets, single,
-        validate_name, Decision, LoadBalancer, Purpose,
+        candidate_names, decide, default_name, fnv1a64, owner_labels, owner_selector,
+        parse_cluster_name, plan_targets, single, validate_name, Decision, LoadBalancer, Purpose,
     };
     use crate::{consts, error::RobotLBError};
     use hcloud::apis::configuration::Configuration as HcloudConfig;
@@ -900,15 +940,62 @@ mod tests {
 
     #[test]
     fn the_default_name_carries_the_namespace() {
-        assert_eq!(default_name("web", "shop"), "web.shop");
-        assert_ne!(default_name("web", "shop"), default_name("web", "blog"));
+        assert_eq!(default_name(None, "web", "shop"), "web.shop");
+        assert_ne!(
+            default_name(None, "web", "shop"),
+            default_name(None, "web", "blog")
+        );
     }
 
     // Both parts are DNS labels of at most 63 characters, Hetzner takes 128.
     #[test]
     fn the_longest_default_name_fits_hetzner() {
         let part = "a".repeat(63);
-        assert_eq!(default_name(&part, &part).len(), 127);
+        assert_eq!(default_name(None, &part, &part).len(), 127);
+    }
+
+    #[test]
+    fn the_default_name_starts_with_the_cluster_name() {
+        assert_eq!(default_name(Some("prod"), "web", "shop"), "prod.web.shop");
+    }
+
+    #[test]
+    fn a_long_default_name_is_cut_to_the_limit_and_hashed() {
+        let part = "a".repeat(63);
+        let full = format!("{part}.{part}.{part}");
+        let name = default_name(Some(&part), &part, &part);
+        assert_eq!(name.len(), 128);
+        assert_eq!(name, format!("{}-{:016x}", &full[..111], fnv1a64(&full)));
+        assert!(validate_name(&name).is_ok());
+    }
+
+    #[test]
+    fn a_default_name_of_128_characters_is_kept_and_one_of_129_is_cut() {
+        let cluster = "a".repeat(63);
+        let service = "b".repeat(62);
+        let kept = default_name(Some(&cluster), &service, "c");
+        assert_eq!(kept, format!("{cluster}.{service}.c"));
+        assert_eq!(kept.len(), 128);
+        let full = format!("{cluster}.{service}.cc");
+        let cut = default_name(Some(&cluster), &service, "cc");
+        assert_eq!(cut, format!("{}-{:016x}", &full[..111], fnv1a64(&full)));
+    }
+
+    #[test]
+    fn long_default_names_differing_after_the_cut_stay_different() {
+        let part = "a".repeat(63);
+        assert_ne!(
+            default_name(Some(&part), &part, &"b".repeat(63)),
+            default_name(Some(&part), &part, &"c".repeat(63)),
+        );
+    }
+
+    // The hash is part of a name balancers are looked up by, it must never change.
+    #[test]
+    fn the_name_hash_is_fnv1a_64() {
+        assert_eq!(fnv1a64(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64("a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64("foobar"), 0x8594_4171_f739_67e8);
     }
 
     #[test]
@@ -1121,5 +1208,111 @@ mod tests {
         };
         let lb = LoadBalancer::try_from_svc(&svc, &context).unwrap();
         assert_eq!(lb.name, " web");
+    }
+
+    fn context_with_cluster_name() -> crate::CurrentContext {
+        use clap::Parser;
+        let config = crate::config::OperatorConfig::try_parse_from([
+            "robotlb",
+            "--hcloud-token",
+            "t",
+            "--cluster-name",
+            "prod",
+        ])
+        .unwrap();
+        let client =
+            kube::Client::try_from(kube::Config::new("http://127.0.0.1:1".parse().unwrap()))
+                .unwrap();
+        crate::CurrentContext::new(client, config, HcloudConfig::default())
+    }
+
+    #[tokio::test]
+    async fn the_cluster_name_prefixes_the_default_name() {
+        let svc = Service {
+            metadata: ObjectMeta {
+                uid: Some("uid-1".to_string()),
+                name: Some("web".to_string()),
+                namespace: Some("shop".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let lb = LoadBalancer::try_from_svc(&svc, &context_with_cluster_name()).unwrap();
+        assert_eq!(lb.name, "prod.web.shop");
+    }
+
+    #[tokio::test]
+    async fn the_cluster_name_leaves_an_annotated_name_alone() {
+        let annotated = "a".repeat(128);
+        let svc = Service {
+            metadata: ObjectMeta {
+                uid: Some("uid-1".to_string()),
+                name: Some("web".to_string()),
+                namespace: Some("shop".to_string()),
+                annotations: Some(
+                    [(consts::LB_NAME_LABEL_NAME.to_string(), annotated.clone())].into(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let lb = LoadBalancer::try_from_svc(&svc, &context_with_cluster_name()).unwrap();
+        assert_eq!(lb.name, annotated);
+    }
+
+    fn parse_cluster_name_arg(
+        cluster_name: &str,
+    ) -> Result<crate::config::OperatorConfig, clap::Error> {
+        use clap::Parser;
+        crate::config::OperatorConfig::try_parse_from([
+            "robotlb".to_string(),
+            "--hcloud-token=t".to_string(),
+            format!("--cluster-name={cluster_name}"),
+        ])
+    }
+
+    #[test]
+    fn the_cluster_name_is_unset_by_default() {
+        use clap::Parser;
+        let config =
+            crate::config::OperatorConfig::try_parse_from(["robotlb", "--hcloud-token", "t"])
+                .unwrap();
+        assert_eq!(config.cluster_name, None);
+    }
+
+    #[test]
+    fn a_dns_label_is_a_valid_cluster_name() {
+        for name in ["a", "prod", "eu-1", "0", &"a".repeat(63)] {
+            assert_eq!(parse_cluster_name(name).as_deref(), Ok(name));
+            assert_eq!(
+                parse_cluster_name_arg(name)
+                    .unwrap()
+                    .cluster_name
+                    .as_deref(),
+                Some(name)
+            );
+        }
+    }
+
+    #[test]
+    fn a_cluster_name_that_is_not_a_dns_label_is_rejected() {
+        for name in [
+            "",
+            "Prod",
+            "eu.prod",
+            "-prod",
+            "prod-",
+            "pr_od",
+            "prød",
+            &"a".repeat(64),
+        ] {
+            assert!(parse_cluster_name(name).is_err(), "{name:?}");
+            let error = parse_cluster_name_arg(name).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{name:?}"
+            );
+        }
     }
 }
