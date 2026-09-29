@@ -67,7 +67,46 @@ pub struct OperatorConfig {
     #[arg(long, env = "ROBOTLB_IPV6_INGRESS", default_value = "false")]
     pub ipv6_ingress: bool,
 
+    /// Seconds between reconciliations of a service that nothing changed. Node changes,
+    /// and endpoint changes of Local services, trigger a reconciliation on their own;
+    /// this interval bounds how long a change made to a balancer outside robotlb survives.
+    /// A service whose balancer refused a target is retried within 30 seconds.
+    #[arg(
+        long,
+        env = "ROBOTLB_RESYNC_INTERVAL",
+        default_value = "300",
+        value_parser = clap::value_parser!(u64).range(1..=31_536_000)
+    )]
+    pub resync_interval: u64,
+
     // Log level of the operator.
     #[arg(long, env = "ROBOTLB_LOG_LEVEL", default_value = "INFO")]
     pub log_level: LevelFilter,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OperatorConfig;
+    use clap::Parser;
+
+    fn parse(resync: &str) -> Result<OperatorConfig, clap::Error> {
+        OperatorConfig::try_parse_from([
+            "robotlb",
+            "--hcloud-token",
+            "t",
+            "--resync-interval",
+            resync,
+        ])
+    }
+
+    // Zero would requeue every successful reconcile right away, spending Hetzner
+    // API requests on every service all the time. The controller's delay queue
+    // panics on delays past about two years.
+    #[test]
+    fn the_resync_interval_must_be_between_a_second_and_a_year() {
+        assert!(parse("0").is_err());
+        assert!(parse("31536001").is_err());
+        assert_eq!(parse("31536000").unwrap().resync_interval, 31_536_000);
+        assert_eq!(parse("1").unwrap().resync_interval, 1);
+    }
 }
