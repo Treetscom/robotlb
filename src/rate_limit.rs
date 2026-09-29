@@ -1,4 +1,6 @@
 use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -67,9 +69,21 @@ impl RateLimitGate {
     }
 }
 
+/// Push a wait out by up to a quarter, differently for each service, so services
+/// paused together do not all call the API the moment the pause ends.
+#[must_use]
+pub fn spread(wait: Duration, service: &str) -> Duration {
+    let mut hasher = DefaultHasher::new();
+    service.hash(&mut hasher);
+    let window = u64::try_from((wait / 4).as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    wait + Duration::from_millis(hasher.finish() % window)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::RateLimitGate;
+    use super::{spread, RateLimitGate};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -137,5 +151,26 @@ mod tests {
             gate.on_rate_limited(later + Duration::from_secs(50)),
             Duration::from_secs(120)
         );
+    }
+
+    #[test]
+    fn spread_adds_up_to_a_quarter_of_the_pause() {
+        let wait = Duration::from_secs(60);
+        for name in ["web", "api", "dns", "ingress-nginx-controller"] {
+            let spread_wait = spread(wait, name);
+            assert!(spread_wait >= wait);
+            assert!(spread_wait < wait + wait / 4);
+        }
+    }
+
+    #[test]
+    fn spread_is_stable_per_service_and_differs_between_services() {
+        let wait = Duration::from_secs(60);
+        assert_eq!(spread(wait, "web"), spread(wait, "web"));
+        let wakeups = ["a", "b", "c", "d", "e", "f"]
+            .map(|name| spread(wait, name))
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        assert!(wakeups.len() > 1);
     }
 }
