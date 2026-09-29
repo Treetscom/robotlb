@@ -39,7 +39,7 @@ use kube::{
 };
 use label_filter::LabelFilter;
 use lb::{LBService, LoadBalancer};
-use rate_limit::RateLimitGate;
+use rate_limit::{spread, RateLimitGate};
 use std::{
     collections::HashSet,
     str::FromStr,
@@ -609,15 +609,23 @@ async fn clear_ingress_status(svc_api: &kube::Api<Service>, svc: &Service) -> Ro
 
 /// Handle the error during reconcilation.
 #[allow(clippy::needless_pass_by_value)]
-fn on_error(_: Arc<Service>, error: &RobotLBError, context: Arc<CurrentContext>) -> Action {
-    error_action(error, &context.rate_limit, Instant::now())
+fn on_error(svc: Arc<Service>, error: &RobotLBError, context: Arc<CurrentContext>) -> Action {
+    let service = format!("{}/{}", svc.namespace().unwrap_or_default(), svc.name_any());
+    error_action(error, &context.rate_limit, Instant::now(), &service)
 }
 
-fn error_action(error: &RobotLBError, rate_limit: &RateLimitGate, now: Instant) -> Action {
+fn error_action(
+    error: &RobotLBError,
+    rate_limit: &RateLimitGate,
+    now: Instant,
+    service: &str,
+) -> Action {
     match error {
         RobotLBError::SkipService => Action::await_change(),
-        RobotLBError::RateLimited(wait) => Action::requeue(*wait),
-        error if error.is_rate_limited() => Action::requeue(rate_limit.on_rate_limited(now)),
+        RobotLBError::RateLimited(wait) => Action::requeue(spread(*wait, service)),
+        error if error.is_rate_limited() => {
+            Action::requeue(spread(rate_limit.on_rate_limited(now), service))
+        }
         _ => Action::requeue(Duration::from_secs(30)),
     }
 }
@@ -843,8 +851,8 @@ mod tests {
         let wait = std::time::Duration::from_secs(42);
         let error = crate::error::RobotLBError::RateLimited(wait);
         assert_eq!(
-            error_action(&error, &gate, std::time::Instant::now()),
-            kube::runtime::controller::Action::requeue(wait)
+            error_action(&error, &gate, std::time::Instant::now(), "shop/web"),
+            kube::runtime::controller::Action::requeue(crate::rate_limit::spread(wait, "shop/web"))
         );
     }
 
@@ -862,8 +870,11 @@ mod tests {
             },
         ));
         assert_eq!(
-            error_action(&error, &gate, now),
-            kube::runtime::controller::Action::requeue(std::time::Duration::from_secs(60))
+            error_action(&error, &gate, now, "shop/web"),
+            kube::runtime::controller::Action::requeue(crate::rate_limit::spread(
+                std::time::Duration::from_secs(60),
+                "shop/web"
+            ))
         );
         assert!(gate.remaining(now).is_some());
     }
@@ -873,7 +884,7 @@ mod tests {
         let gate = crate::rate_limit::RateLimitGate::default();
         let error = crate::error::RobotLBError::HCloudError("boom".to_string());
         assert_eq!(
-            error_action(&error, &gate, std::time::Instant::now()),
+            error_action(&error, &gate, std::time::Instant::now(), "shop/web"),
             kube::runtime::controller::Action::requeue(std::time::Duration::from_secs(30))
         );
     }
