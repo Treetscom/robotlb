@@ -118,6 +118,7 @@ impl CurrentContext {
 }
 
 /// Reconcile the service.
+///
 /// This function is called by the controller for each service.
 /// It will create or update the load balancer based on the service.
 /// If the service is being deleted, it will clean up the resources.
