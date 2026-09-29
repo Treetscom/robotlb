@@ -232,6 +232,18 @@ fn service_role(svc: &Service) -> ServiceRole {
     }
 }
 
+fn balancer_for(
+    role: &ServiceRole,
+    svc: &Service,
+    context: &CurrentContext,
+) -> RobotLBResult<LoadBalancer> {
+    if *role == ServiceRole::Release {
+        LoadBalancer::for_release(svc, context.hcloud_config.clone())
+    } else {
+        LoadBalancer::try_from_svc(svc, context)
+    }
+}
+
 async fn sync_service(svc: Arc<Service>, context: Arc<CurrentContext>) -> RobotLBResult<Action> {
     let role = service_role(&svc);
     if role == ServiceRole::Skip {
@@ -247,7 +259,7 @@ async fn sync_service(svc: Arc<Service>, context: Arc<CurrentContext>) -> RobotL
 
     tracing::info!("Starting service reconcilation");
 
-    let lb = LoadBalancer::try_from_svc(&svc, &context)?;
+    let lb = balancer_for(&role, &svc, &context)?;
 
     if role == ServiceRole::Release {
         tracing::info!("Service no longer needs a load balancer. Cleaning up resources.");
@@ -617,10 +629,11 @@ fn error_action(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_lb_services, consts, error_action, event_note, is_excluded_from_lb,
+        balancer_for, collect_lb_services, consts, error_action, event_note, is_excluded_from_lb,
         is_lb_eligible_node, is_local_traffic_policy, node_source, publishes_event, service_role,
-        NodeSource, ServiceRole,
+        CurrentContext, HCloudConfig, NodeSource, OperatorConfig, RobotLBError, ServiceRole,
     };
+    use clap::Parser;
     use k8s_openapi::{
         api::core::v1::{
             Node, NodeCondition, NodeSpec, NodeStatus, Service, ServicePort, ServiceSpec,
@@ -628,6 +641,31 @@ mod tests {
         apimachinery::pkg::apis::meta::v1::ObjectMeta,
     };
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn only_a_reconciliation_reads_the_annotations() {
+        let config = OperatorConfig::try_parse_from(["robotlb", "--hcloud-token", "t"]).unwrap();
+        let client =
+            kube::Client::try_from(kube::Config::new("http://127.0.0.1:1".parse().unwrap()))
+                .unwrap();
+        let context = CurrentContext::new(client, config, HCloudConfig::default());
+        let svc = Service {
+            metadata: ObjectMeta {
+                uid: Some("uid-1".to_string()),
+                annotations: Some(
+                    [(consts::LB_RETRIES_ANN_NAME.to_string(), "abc".to_string())].into(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(balancer_for(&ServiceRole::Release, &svc, &context).is_ok());
+        assert!(balancer_for(&ServiceRole::Reconcile, &svc, &context).is_err());
+        assert!(matches!(
+            balancer_for(&ServiceRole::Release, &Service::default(), &context),
+            Err(RobotLBError::SkipService)
+        ));
+    }
 
     fn service(spec: ServiceSpec) -> Service {
         Service {
