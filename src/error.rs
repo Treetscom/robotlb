@@ -22,7 +22,7 @@ pub enum RobotLBError {
     UnknownLBAlgorithm,
     #[error("Cannot get target nodes, because the service has no selector")]
     ServiceWithoutSelector,
-    #[error("Hetzner Cloud API rate limit reached, next attempt in {}s", .0.as_secs())]
+    #[error("Hetzner Cloud API rate limit reached, the pause ends in {}s", .0.as_millis().div_ceil(1000))]
     RateLimited(std::time::Duration),
 
     // HCloud API errors
@@ -221,6 +221,12 @@ mod tests {
     fn a_body_that_is_not_json_falls_back_to_the_status() {
         let error = response_error(502, "<html>bad gateway</html>");
         assert_eq!(describe(&error), "502 Bad Gateway");
+    }
+
+    #[test]
+    fn a_pause_shorter_than_a_second_is_not_reported_as_over() {
+        let error = RobotLBError::RateLimited(std::time::Duration::from_millis(300));
+        assert!(error.to_string().ends_with("in 1s"));
     }
 
     #[test]
