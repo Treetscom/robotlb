@@ -18,7 +18,7 @@
 
 use clap::Parser;
 use config::OperatorConfig;
-use error::{RobotLBError, RobotLBResult};
+use error::{redact, RobotLBError, RobotLBResult};
 use futures::StreamExt;
 use hcloud::apis::configuration::Configuration as HCloudConfig;
 use k8s_openapi::{
@@ -30,12 +30,22 @@ use k8s_openapi::{
 };
 use kube::{
     api::{ListParams, PatchParams},
-    runtime::{controller::Action, watcher, Controller},
+    runtime::{
+        controller::{self, Action},
+        events::{Event, EventType, Recorder, Reporter},
+        watcher, Controller,
+    },
     Resource, ResourceExt,
 };
 use label_filter::LabelFilter;
 use lb::{LBService, LoadBalancer};
-use std::{collections::HashSet, str::FromStr, sync::Arc, time::Duration};
+use rate_limit::{spread, RateLimitGate};
+use std::{
+    collections::HashSet,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 pub mod config;
 pub mod consts;
@@ -43,6 +53,7 @@ pub mod error;
 pub mod finalizers;
 pub mod label_filter;
 pub mod lb;
+pub mod rate_limit;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -69,27 +80,38 @@ async fn main() -> RobotLBResult<()> {
         hcloud_conf,
     ));
     tracing::info!("Starting the controller");
+    let token = operator_config.hcloud_token;
     Controller::new(
         kube::Api::<Service>::all(kube_client),
         watcher::Config::default(),
     )
     .run(reconcile_service, on_error, context)
-    .for_each(|reconcilation_result| async move {
-        match reconcilation_result {
-            Ok((service, _action)) => {
-                tracing::info!("Reconcilation of a service {} was successful", service.name);
-            }
-            Err(err) => match err {
+    .for_each(|reconcilation_result| {
+        let token = token.clone();
+        async move {
+            match reconcilation_result {
+                Ok((service, _action)) => {
+                    tracing::info!("Reconcilation of a service {} was successful", service.name);
+                }
                 // During reconcilation process,
                 // the controller has decided to skip the service.
-                kube::runtime::controller::Error::ReconcilerFailed(
-                    RobotLBError::SkipService,
-                    _,
-                ) => {}
-                _ => {
-                    tracing::error!("Error reconciling service: {:#?}", err);
+                Err(controller::Error::ReconcilerFailed(RobotLBError::SkipService, _)) => {}
+                Err(controller::Error::ReconcilerFailed(
+                    error @ RobotLBError::RateLimited(_),
+                    service,
+                )) => {
+                    tracing::info!("Service {service}: {error}");
                 }
-            },
+                Err(controller::Error::ReconcilerFailed(error, service)) => {
+                    tracing::error!(
+                        "Reconcilation of service {service} failed: {}",
+                        redact(&error.to_string(), &token)
+                    );
+                }
+                Err(error) => {
+                    tracing::error!("Controller error: {}", redact(&error.to_string(), &token));
+                }
+            }
         }
     })
     .await;
@@ -101,18 +123,16 @@ pub struct CurrentContext {
     pub client: kube::Client,
     pub config: OperatorConfig,
     pub hcloud_config: HCloudConfig,
+    pub rate_limit: Arc<RateLimitGate>,
 }
 impl CurrentContext {
     #[must_use]
-    pub const fn new(
-        client: kube::Client,
-        config: OperatorConfig,
-        hcloud_config: HCloudConfig,
-    ) -> Self {
+    pub fn new(client: kube::Client, config: OperatorConfig, hcloud_config: HCloudConfig) -> Self {
         Self {
             client,
             config,
             hcloud_config,
+            rate_limit: Arc::default(),
         }
     }
 }
@@ -126,6 +146,60 @@ pub async fn reconcile_service(
     svc: Arc<Service>,
     context: Arc<CurrentContext>,
 ) -> RobotLBResult<Action> {
+    let result = sync_service(svc.clone(), context.clone()).await;
+    if let Err(error) = &result {
+        if publishes_event(error) {
+            report_failure(&svc, &context, error).await;
+        }
+    }
+    result
+}
+
+/// Skipped services are every service robotlb does not own. A service waiting at the
+/// rate limit gate still gets an event each time it wakes up to a closed gate.
+const fn publishes_event(error: &RobotLBError) -> bool {
+    !matches!(error, RobotLBError::SkipService)
+}
+
+/// Put the error on the service as a warning event, where `kubectl describe` shows it.
+async fn report_failure(svc: &Service, context: &CurrentContext, error: &RobotLBError) {
+    let recorder = Recorder::new(
+        context.client.clone(),
+        Reporter {
+            controller: "robotlb".to_string(),
+            instance: None,
+        },
+        svc.object_ref(&()),
+    );
+    let published = recorder
+        .publish(Event {
+            type_: EventType::Warning,
+            reason: "SyncLoadBalancerFailed".to_string(),
+            note: Some(event_note(error, &context.config.hcloud_token)),
+            action: "Reconcile".to_string(),
+            secondary: None,
+        })
+        .await;
+    if let Err(publish_error) = published {
+        tracing::warn!("Cannot publish an event for the service: {publish_error}");
+    }
+}
+
+/// The error as an event note: token redacted and cut to the size the API accepts.
+fn event_note(error: &RobotLBError, token: &str) -> String {
+    const MAX_NOTE_BYTES: usize = 1024;
+    let mut note = redact(&error.to_string(), token);
+    if note.len() > MAX_NOTE_BYTES {
+        let mut end = MAX_NOTE_BYTES;
+        while !note.is_char_boundary(end) {
+            end -= 1;
+        }
+        note.truncate(end);
+    }
+    note
+}
+
+async fn sync_service(svc: Arc<Service>, context: Arc<CurrentContext>) -> RobotLBResult<Action> {
     let svc_type = svc
         .spec
         .as_ref()
@@ -146,6 +220,12 @@ pub async fn reconcile_service(
     if lb_type != consts::ROBOTLB_LB_CLASS {
         tracing::debug!("Load balancer class is not robotlb. Skipping...");
         return Err(RobotLBError::SkipService);
+    }
+
+    // Hetzner counts requests per project, so while one service is rate limited
+    // every other one waits too instead of spending the budget being waited for.
+    if let Some(wait) = context.rate_limit.remaining(Instant::now()) {
+        return Err(RobotLBError::RateLimited(wait));
     }
 
     tracing::info!("Starting service reconcilation");
@@ -526,9 +606,23 @@ async fn clear_ingress_status(svc_api: &kube::Api<Service>, svc: &Service) -> Ro
 
 /// Handle the error during reconcilation.
 #[allow(clippy::needless_pass_by_value)]
-fn on_error(_: Arc<Service>, error: &RobotLBError, _context: Arc<CurrentContext>) -> Action {
+fn on_error(svc: Arc<Service>, error: &RobotLBError, context: Arc<CurrentContext>) -> Action {
+    let service = format!("{}/{}", svc.namespace().unwrap_or_default(), svc.name_any());
+    error_action(error, &context.rate_limit, Instant::now(), &service)
+}
+
+fn error_action(
+    error: &RobotLBError,
+    rate_limit: &RateLimitGate,
+    now: Instant,
+    service: &str,
+) -> Action {
     match error {
         RobotLBError::SkipService => Action::await_change(),
+        RobotLBError::RateLimited(wait) => Action::requeue(spread(*wait, service)),
+        error if error.is_rate_limited() => {
+            Action::requeue(spread(rate_limit.on_rate_limited(now), service))
+        }
         _ => Action::requeue(Duration::from_secs(30)),
     }
 }
@@ -536,8 +630,8 @@ fn on_error(_: Arc<Service>, error: &RobotLBError, _context: Arc<CurrentContext>
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_lb_services, consts, is_excluded_from_lb, is_lb_eligible_node,
-        is_local_traffic_policy, node_source, NodeSource,
+        collect_lb_services, consts, error_action, event_note, is_excluded_from_lb,
+        is_lb_eligible_node, is_local_traffic_policy, node_source, publishes_event, NodeSource,
     };
     use k8s_openapi::{
         api::core::v1::{
@@ -732,5 +826,86 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(node_source(&svc, false), NodeSource::Annotation);
+    }
+
+    #[test]
+    fn an_event_note_is_redacted_and_bounded() {
+        let token = "0123456789abcdef";
+        let error = crate::error::RobotLBError::HCloudError(format!(
+            "rejected token {} {}",
+            &token[..10],
+            "é".repeat(600)
+        ));
+        let note = event_note(&error, token);
+        assert!(!note.contains(&token[..10]));
+        assert!(note.contains("[REDACTED]"));
+        assert!(note.len() <= 1024);
+    }
+
+    #[test]
+    fn a_gated_service_waits_out_the_pause() {
+        let gate = crate::rate_limit::RateLimitGate::default();
+        let wait = std::time::Duration::from_secs(42);
+        let error = crate::error::RobotLBError::RateLimited(wait);
+        assert_eq!(
+            error_action(&error, &gate, std::time::Instant::now(), "shop/web"),
+            kube::runtime::controller::Action::requeue(crate::rate_limit::spread(wait, "shop/web"))
+        );
+    }
+
+    #[test]
+    fn a_rate_limited_call_closes_the_gate() {
+        let gate = crate::rate_limit::RateLimitGate::default();
+        let now = std::time::Instant::now();
+        let error = crate::error::RobotLBError::from(hcloud::apis::Error::<
+            hcloud::apis::load_balancers_api::AddTargetError,
+        >::ResponseError(
+            hcloud::apis::ResponseContent {
+                status: 429_u16.try_into().unwrap(),
+                content: String::new(),
+                entity: None,
+            },
+        ));
+        assert_eq!(
+            error_action(&error, &gate, now, "shop/web"),
+            kube::runtime::controller::Action::requeue(crate::rate_limit::spread(
+                std::time::Duration::from_secs(60),
+                "shop/web"
+            ))
+        );
+        assert!(gate.remaining(now).is_some());
+    }
+
+    #[test]
+    fn other_errors_retry_in_30_seconds() {
+        let gate = crate::rate_limit::RateLimitGate::default();
+        let error = crate::error::RobotLBError::HCloudError("boom".to_string());
+        assert_eq!(
+            error_action(&error, &gate, std::time::Instant::now(), "shop/web"),
+            kube::runtime::controller::Action::requeue(std::time::Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn every_failure_except_a_skip_publishes_an_event() {
+        use crate::error::RobotLBError;
+        assert!(!publishes_event(&RobotLBError::SkipService));
+        // Jitter wakes the same service first after every pause, so the others only
+        // ever see the closed gate, and without an event of their own they go silent.
+        assert!(publishes_event(&RobotLBError::RateLimited(
+            std::time::Duration::from_secs(1)
+        )));
+        assert!(publishes_event(&RobotLBError::from(hcloud::apis::Error::<
+            hcloud::apis::load_balancers_api::ListLoadBalancersError,
+        >::ResponseError(
+            hcloud::apis::ResponseContent {
+                status: 429_u16.try_into().unwrap(),
+                content: String::new(),
+                entity: None,
+            }
+        ))));
+        assert!(publishes_event(&RobotLBError::HCloudError(
+            "boom".to_string()
+        )));
     }
 }
