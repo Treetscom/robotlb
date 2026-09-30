@@ -448,7 +448,7 @@ impl LoadBalancer {
         &self,
         hcloud_balancer: &hcloud::models::LoadBalancer,
     ) -> RobotLBResult<()> {
-        if *hcloud_balancer.algorithm == self.algorithm.clone().into() {
+        if *hcloud_balancer.algorithm == self.algorithm.clone() {
             return Ok(());
         }
         tracing::info!(
@@ -461,7 +461,7 @@ impl LoadBalancer {
                 &self.hcloud_config,
                 ChangeAlgorithmParams {
                     id: hcloud_balancer.id,
-                    body: Some(self.algorithm.clone().into()),
+                    body: Some(self.algorithm.clone()),
                 },
             )
         })
@@ -728,15 +728,13 @@ impl LoadBalancer {
                 network_name
             );
             return Err(RobotLBError::HCloudError(format!(
-                "Found more than one network with name {}",
-                network_name,
+                "Found more than one network with name {network_name}",
             )));
         }
         if response.networks.is_empty() {
             tracing::warn!("Network with name {} not found", network_name);
             return Err(RobotLBError::HCloudError(format!(
-                "Network with name {} not found",
-                network_name,
+                "Network with name {network_name} not found",
             )));
         }
 

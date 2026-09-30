@@ -68,7 +68,6 @@ Every port of the service needs an allocated `nodePort`. A Hetzner load balancer
 > kubectl get services --all-namespaces --output json | jq --raw-output '.items[] | select(((.metadata.finalizers // []) | index("robotlb/finalizer")) and (.spec.type != "LoadBalancer" or (.spec.loadBalancerClass // "robotlb") != "robotlb")) | "\(.metadata.namespace)/\(.metadata.name)"'
 > ```
 
-
 ## Configuration
 
 This project has two places for configuration: environment variables and service annotations.
@@ -79,7 +78,7 @@ Environment variables are mainly used to override default arguments and provide 
 
 Here’s a complete list of parameters for the operator's binary:
 
-```
+```text
 Usage: robotlb [OPTIONS] --hcloud-token <HCLOUD_TOKEN>
 
 Options:
@@ -115,9 +114,7 @@ Options:
           Print help
 ```
 
-
 ### Service annotations
-
 
 ```yaml
 apiVersion: v1
