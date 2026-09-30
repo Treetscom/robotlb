@@ -14,6 +14,9 @@ fullnameOverride: ""
 
 envs:
   ROBOTLB_LOG_LEVEL: "INFO"
+  # Put in front of default balancer names when several clusters share a Hetzner
+  # project. A DNS label: lowercase letters, digits and `-`, at most 63 characters.
+  # ROBOTLB_CLUSTER_NAME: "prod"
 
 existingSecrets: []
 
@@ -28,7 +31,7 @@ serviceAccount:
   # If not set and create is true, a name is generated using the fullname template
   name: ""
   # This is a list of cluster permissions to apply to the service account.
-  # By default it grants all permissions.
+  # The default is what robotlb needs; a custom list replaces it entirely.
   permissions:
   - apiGroups: [""]
     resources: [services, services/status]
@@ -39,6 +42,9 @@ serviceAccount:
   - apiGroups: [discovery.k8s.io]
     resources: [endpointslices]
     verbs: [get, list, watch]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [create]
 
 podAnnotations: {}
 podLabels: {}
