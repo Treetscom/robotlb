@@ -118,7 +118,7 @@ pub enum RobotLBError {
 impl RobotLBError {
     /// Whether Hetzner rejected the call because the project ran out of API requests.
     #[must_use]
-    pub fn is_rate_limited(&self) -> bool {
+    pub const fn is_rate_limited(&self) -> bool {
         // No wildcard arm: a new variant must be sorted into one of the two groups.
         match self {
             Self::HCloudLBAttachToNetworkError(error) => is_rate_limit_response(error),
@@ -158,7 +158,7 @@ impl RobotLBError {
 
 /// Whether Hetzner answered 429 because the project ran out of API requests.
 #[must_use]
-pub fn is_rate_limit_response<T>(error: &hcloud::apis::Error<T>) -> bool {
+pub const fn is_rate_limit_response<T>(error: &hcloud::apis::Error<T>) -> bool {
     matches!(error, hcloud::apis::Error::ResponseError(response) if response.status.as_u16() == 429)
 }
 
