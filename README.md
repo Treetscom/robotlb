@@ -35,10 +35,12 @@ After the chart is installed, you should be able to create `LoadBalancer` servic
 
 The operator listens to the Kubernetes API for services of type `LoadBalancer` and creates Hetzner load balancers that point to nodes based on `node-ip`.
 
+A balancer is updated when its service changes, when a node is added, removed, relabelled, cordoned or changes readiness or addresses, and, for services with `externalTrafficPolicy: Local` while `ROBOTLB_DYNAMIC_NODE_SELECTOR` is on, when the nodes their endpoints serve traffic from change; a deleted endpoint slice of such a service rechecks every balancer. Apart from that robotlb checks each balancer every `ROBOTLB_RESYNC_INTERVAL` seconds, 300 by default, which bounds how long a change made to the balancer in Hetzner survives. Each check costs one or two Hetzner API requests per service. When Hetzner refuses a target for a reason other than the rate limit, the service is checked again within 30 seconds instead, so a node it refuses for good, such as one outside the vSwitch subnet, keeps its service on that 30-second cycle.
+
 Target nodes are selected according to the service's `externalTrafficPolicy`:
 
 - `Cluster`, the Kubernetes default: every node of the cluster becomes a target, since kube-proxy forwards the traffic to a node that hosts a pod. Cordoned and not-ready nodes are left out, as they would only take up target slots.
-- `Local`: only the nodes where the service's target pods run, found through the service selector, or through the service's `EndpointSlice` resources when it has no selector.
+- `Local`: only the nodes kube-proxy serves the traffic from, read from the service's `EndpointSlice` resources whether or not the service has a selector. These are the nodes with a ready endpoint, or with a terminating endpoint that still serves while the node has no ready one. Endpoint conditions decide, not whether a pod runs on the node: a node whose pods are not ready is left out, and a cordoned or not-ready node stays a target while it has such an endpoint.
 
 Nodes labelled `node.kubernetes.io/exclude-from-external-load-balancers`, which kubeadm puts on control-plane nodes, stay out of every balancer under either policy.
 
@@ -88,7 +90,7 @@ Options:
       --default-network <DEFAULT_NETWORK>
           Default network to use for load balancers. If not set, then only network from the service annotation will be used [env: ROBOTLB_DEFAULT_NETWORK=]
       --dynamic-node-selector
-          If enabled, the operator will try to find target nodes based on where the target pods are actually deployed. If disabled, the operator will try to find target nodes based on the node selector [env: ROBOTLB_DYNAMIC_NODE_SELECTOR=]
+          If enabled, the operator will try to find target nodes based on the service's traffic policy, and under `Local` on the nodes serving the service's endpoints. If disabled, the operator will try to find target nodes based on the node selector [env: ROBOTLB_DYNAMIC_NODE_SELECTOR=]
       --default-lb-retries <DEFAULT_LB_RETRIES>
           Default load balancer healthcheck retries cound [env: ROBOTLB_DEFAULT_LB_RETRIES=] [default: 3]
       --default-lb-timeout <DEFAULT_LB_TIMEOUT>
@@ -105,6 +107,8 @@ Options:
           Default load balancer proxy mode. If enabled, the load balancer will act as a proxy for the target servers. The default value is `false`. https://docs.hetzner.com/cloud/load-balancers/faq/#what-does-proxy-protocol-mean-and-should-i-enable-it [env: ROBOTLB_DEFAULT_LB_PROXY_MODE_ENABLED=]
       --ipv6-ingress
           Whether to enable IPv6 ingress for the load balancer. If enabled, the load balancer's IPv6 will be attached to the service as an external IP along with IPv4 [env: ROBOTLB_IPV6_INGRESS=]
+      --resync-interval <RESYNC_INTERVAL>
+          Seconds between reconciliations of a service that nothing changed. Node changes, and endpoint changes of Local services, trigger a reconciliation on their own; this interval bounds how long a change made to a balancer outside robotlb survives. A service whose balancer refused a target is retried within 30 seconds [env: ROBOTLB_RESYNC_INTERVAL=] [default: 300]
       --log-level <LOG_LEVEL>
           [env: ROBOTLB_LOG_LEVEL=] [default: INFO]
   -h, --help
@@ -160,8 +164,9 @@ metadata:
     robotlb/balancer-type: "lb11"
 spec:
   type: LoadBalancer
-  # If dynamic node selector is enabled, nodes will be found
-  # using this property.
+  # The selector fills the service's endpoints; with
+  # externalTrafficPolicy: Local and the dynamic node selector
+  # enabled, the nodes serving them become the targets.
   selector:
     app: target
   ports:

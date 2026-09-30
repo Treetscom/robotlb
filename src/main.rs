@@ -24,7 +24,7 @@ use futures::StreamExt;
 use hcloud::apis::configuration::Configuration as HCloudConfig;
 use k8s_openapi::{
     api::{
-        core::v1::{Node, Pod, Service},
+        core::v1::{Node, Service},
         discovery::v1::EndpointSlice,
     },
     serde_json::json,
@@ -34,7 +34,7 @@ use kube::{
     runtime::{
         controller::{self, Action},
         events::{Event, EventType, Recorder, Reporter},
-        watcher, Controller,
+        watcher, Controller, WatchStreamExt,
     },
     Resource, ResourceExt,
 };
@@ -56,6 +56,7 @@ pub mod finalizers;
 pub mod label_filter;
 pub mod lb;
 pub mod rate_limit;
+pub mod triggers;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -75,7 +76,6 @@ async fn main() -> RobotLBResult<()> {
     tracing::info!("Starting robotlb operator v{}", env!("CARGO_PKG_VERSION"));
     let kube_client = kube::Client::try_default().await?;
     tracing::info!("Kube client is connected");
-    watcher::Config::default();
     let context = Arc::new(CurrentContext::new(
         kube_client.clone(),
         operator_config.clone(),
@@ -83,41 +83,142 @@ async fn main() -> RobotLBResult<()> {
     ));
     tracing::info!("Starting the controller");
     let token = operator_config.hcloud_token;
-    Controller::new(
-        kube::Api::<Service>::all(kube_client),
+    let dynamic_node_selector = operator_config.dynamic_node_selector;
+    let controller = Controller::new(
+        kube::Api::<Service>::all(kube_client.clone()),
         watcher::Config::default(),
-    )
-    .run(reconcile_service, on_error, context)
-    .for_each(|reconcilation_result| {
-        let token = token.clone();
-        async move {
-            match reconcilation_result {
-                Ok((service, _action)) => {
-                    tracing::info!("Reconcilation of a service {} was successful", service.name);
-                }
-                // During reconcilation process,
-                // the controller has decided to skip the service.
-                Err(controller::Error::ReconcilerFailed(RobotLBError::SkipService, _)) => {}
-                Err(controller::Error::ReconcilerFailed(
-                    error @ RobotLBError::RateLimited(_),
-                    service,
-                )) => {
-                    tracing::info!("Service {service}: {error}");
-                }
-                Err(controller::Error::ReconcilerFailed(error, service)) => {
-                    tracing::error!(
-                        "Reconcilation of service {service} failed: {}",
-                        redact(&error.to_string(), &token)
-                    );
-                }
-                Err(error) => {
-                    tracing::error!("Controller error: {}", redact(&error.to_string(), &token));
+    );
+    let services = controller.store();
+    let slice_changes = Arc::new(triggers::SliceChanges::default());
+    controller
+        .reconcile_all_on(cluster_changes(kube_client.clone(), slice_changes.clone()))
+        .watches(
+            kube::Api::<EndpointSlice>::all(kube_client),
+            watcher::Config::default(),
+            move |slice| {
+                triggers::slice_service(&slice).filter(|service| {
+                    let svc = services.get(service);
+                    slice_triggers(
+                        &slice,
+                        svc.as_deref(),
+                        dynamic_node_selector,
+                        &slice_changes,
+                    )
+                })
+            },
+        )
+        .run(reconcile_service, on_error, context)
+        .for_each(|reconcilation_result| {
+            let token = token.clone();
+            async move {
+                match reconcilation_result {
+                    Ok((service, _action)) => {
+                        tracing::info!(
+                            "Reconcilation of a service {} was successful",
+                            service.name
+                        );
+                    }
+                    // During reconcilation process,
+                    // the controller has decided to skip the service.
+                    Err(controller::Error::ReconcilerFailed(RobotLBError::SkipService, _)) => {}
+                    Err(controller::Error::ReconcilerFailed(
+                        error @ RobotLBError::RateLimited(_),
+                        service,
+                    )) => {
+                        tracing::info!("Service {service}: {error}");
+                    }
+                    Err(controller::Error::ReconcilerFailed(error, service)) => {
+                        tracing::error!(
+                            "Reconcilation of service {service} failed: {}",
+                            redact(&error.to_string(), &token)
+                        );
+                    }
+                    Err(error) => {
+                        tracing::error!("Controller error: {}", redact(&error.to_string(), &token));
+                    }
                 }
             }
-        }
-    })
-    .await;
+        })
+        .await;
     Ok(())
+}
+
+fn is_robotlb_load_balancer(svc: &Service) -> bool {
+    let spec = svc.spec.as_ref();
+    spec.and_then(|spec| spec.type_.as_deref()) == Some("LoadBalancer")
+        && spec
+            .and_then(|spec| spec.load_balancer_class.as_deref())
+            .unwrap_or(consts::ROBOTLB_LB_CLASS)
+            == consts::ROBOTLB_LB_CLASS
+}
+
+/// Whether a change of the slice should reconcile its service. Only services that
+/// target the nodes of their endpoints care where those run.
+fn slice_triggers(
+    slice: &EndpointSlice,
+    svc: Option<&Service>,
+    dynamic_node_selector: bool,
+    changes: &triggers::SliceChanges,
+) -> bool {
+    let observed = svc.is_some_and(|svc| {
+        is_robotlb_load_balancer(svc)
+            && node_source(svc, dynamic_node_selector) == NodeSource::ServiceEndpoints
+    });
+    if !observed {
+        changes.forget(slice);
+        return false;
+    }
+    changes.observe(slice)
+}
+
+/// A signal each time nodes change in a way that can change balancer targets, or an
+/// endpoint slice with endpoints is deleted.
+fn cluster_changes(
+    client: kube::Client,
+    slices: Arc<triggers::SliceChanges>,
+) -> impl futures::Stream<Item = ()> + Send + Sync {
+    let (sender, receiver) = futures::channel::mpsc::unbounded();
+    let node_sender = sender.clone();
+    let node_client = client.clone();
+    tokio::spawn(async move {
+        let mut changes = triggers::NodeChanges::default();
+        let mut events = std::pin::pin!(watcher::watcher(
+            kube::Api::<Node>::all(node_client),
+            watcher::Config::default()
+        )
+        .default_backoff());
+        while let Some(event) = events.next().await {
+            match event {
+                Ok(event) => {
+                    if changes.observe(&event) && node_sender.unbounded_send(()).is_err() {
+                        return;
+                    }
+                }
+                Err(error) => tracing::warn!("Node watch failed: {error}"),
+            }
+        }
+    });
+    // A deleted slice triggers every service, since only the unstable
+    // `Controller::reconcile_on` can target one. Once kube-runtime stabilizes it,
+    // send the slice's service there instead and drop this watch's reconcile-all.
+    tokio::spawn(async move {
+        let mut events = std::pin::pin!(watcher::metadata_watcher(
+            kube::Api::<EndpointSlice>::all(client),
+            watcher::Config::default()
+        )
+        .default_backoff());
+        while let Some(event) = events.next().await {
+            match event {
+                Ok(event) => {
+                    if slices.track(&event) && sender.unbounded_send(()).is_err() {
+                        return;
+                    }
+                }
+                Err(error) => tracing::warn!("Endpoint slice watch failed: {error}"),
+            }
+        }
+    });
+    receiver
 }
 
 #[derive(Clone)]
@@ -231,14 +332,7 @@ enum ServiceRole {
 /// so once the type changes only the finalizer still marks the service as robotlb's,
 /// and a service with the finalizer that robotlb no longer serves gets released.
 fn service_role(svc: &Service) -> ServiceRole {
-    let is_load_balancer =
-        svc.spec.as_ref().and_then(|s| s.type_.as_deref()) == Some("LoadBalancer");
-    let class = svc
-        .spec
-        .as_ref()
-        .and_then(|s| s.load_balancer_class.as_deref())
-        .unwrap_or(consts::ROBOTLB_LB_CLASS);
-    let is_robotlb = is_load_balancer && class == consts::ROBOTLB_LB_CLASS;
+    let is_robotlb = is_robotlb_load_balancer(svc);
     let owned = finalizers::check(svc);
     let deleting = svc.meta().deletion_timestamp.is_some();
     if (deleting && is_robotlb) || (owned && !is_robotlb) {
@@ -295,68 +389,9 @@ async fn sync_service(svc: Arc<Service>, context: Arc<CurrentContext>) -> RobotL
     reconcile_load_balancer(lb, svc.clone(), context).await
 }
 
-/// Method to get nodes dynamically based on the pods.
-/// This method will find the nodes where the target pods are deployed.
-/// It will use the pod selector to find the pods and then get the nodes.
-async fn get_nodes_dynamically(
-    svc: &Arc<Service>,
-    context: &Arc<CurrentContext>,
-) -> RobotLBResult<Vec<Node>> {
-    let pod_api = kube::Api::<Pod>::namespaced(
-        context.client.clone(),
-        svc.namespace()
-            .as_ref()
-            .map(String::as_str)
-            .unwrap_or_else(|| context.client.default_namespace()),
-    );
-
-    let Some(pod_selector) = svc
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.selector.clone())
-        .filter(|s| !s.is_empty())
-    else {
-        tracing::info!(
-            "Service has no selector, falling back to EndpointSlice-based node discovery"
-        );
-        return get_nodes_from_endpointslices(svc, context).await;
-    };
-
-    let label_selector = pod_selector
-        .iter()
-        .map(|(key, val)| format!("{key}={val}"))
-        .collect::<Vec<_>>()
-        .join(",");
-
-    let pods = pod_api
-        .list(&ListParams {
-            label_selector: Some(label_selector),
-            ..Default::default()
-        })
-        .await?;
-
-    let target_nodes = pods
-        .iter()
-        .map(|pod| pod.spec.clone().unwrap_or_default().node_name)
-        .flatten()
-        .collect::<HashSet<_>>();
-
-    let nodes_api = kube::Api::<Node>::all(context.client.clone());
-    let nodes = nodes_api
-        .list(&ListParams::default())
-        .await?
-        .into_iter()
-        .filter(|node| target_nodes.contains(&node.name_any()) && !is_excluded_from_lb(node))
-        .collect::<Vec<_>>();
-
-    Ok(nodes)
-}
-
-/// Get nodes from `EndpointSlice` resources associated with a Service.
-/// This method is used as a fallback when the Service has no selector,
-/// such as when `EndpointSlice` resources are managed by an external controller
-/// (e.g. kubevirt cloud-controller-manager).
-/// It discovers target nodes by reading the `nodeName` field from each endpoint.
+/// Get the nodes kube-proxy serves the service's Local traffic from. Reading the
+/// slices rather than the pods also covers services whose slices another controller
+/// manages (e.g. kubevirt cloud-controller-manager).
 async fn get_nodes_from_endpointslices(
     svc: &Arc<Service>,
     context: &Arc<CurrentContext>,
@@ -373,10 +408,8 @@ async fn get_nodes_from_endpointslices(
         .await?;
 
     let target_nodes = eps_list
-        .into_iter()
-        .flat_map(|eps| eps.endpoints)
-        .filter(|ep| ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true))
-        .filter_map(|ep| ep.node_name)
+        .iter()
+        .flat_map(triggers::slice_nodes)
         .collect::<HashSet<_>>();
 
     if target_nodes.is_empty() {
@@ -540,7 +573,7 @@ pub async fn reconcile_load_balancer(
 
     let nodes = match node_source(&svc, context.config.dynamic_node_selector) {
         NodeSource::Annotation => get_nodes_by_selector(&svc, &context).await?,
-        NodeSource::ServiceEndpoints => get_nodes_dynamically(&svc, &context).await?,
+        NodeSource::ServiceEndpoints => get_nodes_from_endpointslices(&svc, &context).await?,
         NodeSource::AllNodes => get_all_nodes(&context).await?,
     };
 
@@ -570,7 +603,7 @@ pub async fn reconcile_load_balancer(
         return Err(RobotLBError::NoExposablePorts);
     }
 
-    let hcloud_lb = lb.reconcile().await?;
+    let (hcloud_lb, targets_missing) = lb.reconcile().await?;
 
     let svc_api = kube::Api::<Service>::namespaced(
         context.client.clone(),
@@ -618,7 +651,20 @@ pub async fn reconcile_load_balancer(
             .await?;
     }
 
-    Ok(Action::requeue(Duration::from_secs(30)))
+    Ok(Action::requeue(success_requeue(
+        targets_missing,
+        context.config.resync_interval,
+    )))
+}
+
+/// A target Hetzner rejected, for a reason other than the rate limit, may be accepted
+/// on the next try, so it is retried as soon as a failed reconcile would be.
+const fn success_requeue(targets_missing: bool, resync_interval: u64) -> Duration {
+    if targets_missing && resync_interval > 30 {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(resync_interval)
+    }
 }
 
 /// Handle the error during reconcilation.
@@ -655,7 +701,8 @@ mod tests {
     use super::{
         balancer_for, collect_lb_services, consts, error_action, event_note, is_excluded_from_lb,
         is_lb_eligible_node, is_local_traffic_policy, node_source, publishes_event, service_role,
-        CurrentContext, HCloudConfig, NodeSource, OperatorConfig, RobotLBError, ServiceRole,
+        slice_triggers, success_requeue, CurrentContext, HCloudConfig, NodeSource, OperatorConfig,
+        RobotLBError, ServiceRole,
     };
     use clap::Parser;
     use k8s_openapi::{
@@ -1122,5 +1169,145 @@ mod tests {
         let error = crate::error::RobotLBError::NoExposablePorts;
         assert!(publishes_event(&error));
         assert!(error.to_string().starts_with("No TCP port"));
+    }
+
+    fn endpoint_slice(node: &str) -> k8s_openapi::api::discovery::v1::EndpointSlice {
+        k8s_openapi::api::discovery::v1::EndpointSlice {
+            metadata: ObjectMeta {
+                name: Some("web-abcde".to_string()),
+                namespace: Some("shop".to_string()),
+                ..Default::default()
+            },
+            endpoints: vec![k8s_openapi::api::discovery::v1::Endpoint {
+                node_name: Some(node.to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn live(
+        slice: &k8s_openapi::api::discovery::v1::EndpointSlice,
+    ) -> crate::triggers::SliceChanges {
+        use kube::runtime::watcher::Event;
+        let changes = crate::triggers::SliceChanges::default();
+        changes.track(&Event::<k8s_openapi::api::discovery::v1::EndpointSlice>::Init);
+        changes.track(&Event::InitApply(slice.clone()));
+        changes.track(&Event::<k8s_openapi::api::discovery::v1::EndpointSlice>::InitDone);
+        changes
+    }
+
+    fn with_policy(policy: &str) -> Service {
+        service(ServiceSpec {
+            type_: Some("LoadBalancer".to_string()),
+            external_traffic_policy: Some(policy.to_string()),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_slice_of_a_local_service_triggers_only_when_its_nodes_change() {
+        let slice = endpoint_slice("a");
+        let changes = live(&slice);
+        let svc = with_policy("Local");
+        assert!(slice_triggers(&slice, Some(&svc), true, &changes));
+        assert!(!slice_triggers(&slice, Some(&svc), true, &changes));
+        assert!(slice_triggers(
+            &endpoint_slice("b"),
+            Some(&svc),
+            true,
+            &changes
+        ));
+    }
+
+    #[test]
+    fn a_slice_of_a_service_that_ignores_endpoints_triggers_nothing_and_is_forgotten() {
+        let slice = endpoint_slice("a");
+        let changes = live(&slice);
+        let local = with_policy("Local");
+        slice_triggers(&slice, Some(&local), true, &changes);
+        assert!(!slice_triggers(
+            &slice,
+            Some(&with_policy("Cluster")),
+            true,
+            &changes
+        ));
+        assert!(!slice_triggers(&slice, Some(&local), false, &changes));
+        assert!(slice_triggers(&slice, Some(&local), true, &changes));
+    }
+
+    #[test]
+    fn a_slice_without_a_known_service_triggers_nothing() {
+        let slice = endpoint_slice("a");
+        assert!(!slice_triggers(&slice, None, true, &live(&slice)));
+    }
+
+    fn flapping_slice(ready: bool) -> k8s_openapi::api::discovery::v1::EndpointSlice {
+        let mut slice = endpoint_slice("a");
+        slice.endpoints[0].conditions = Some(k8s_openapi::api::discovery::v1::EndpointConditions {
+            ready: Some(ready),
+            ..Default::default()
+        });
+        slice
+    }
+
+    // A cordoned or not-ready node keeps running its pods, so it is the readiness of
+    // their endpoints that takes the node out of the targets.
+    #[test]
+    fn a_readiness_flap_triggers_a_local_service_with_a_selector() {
+        let with_selector = service(ServiceSpec {
+            type_: Some("LoadBalancer".to_string()),
+            external_traffic_policy: Some("Local".to_string()),
+            selector: Some(BTreeMap::from([("app".to_string(), "web".to_string())])),
+            ..Default::default()
+        });
+        let ready = flapping_slice(true);
+        let changes = live(&ready);
+        slice_triggers(&ready, Some(&with_selector), true, &changes);
+        assert!(slice_triggers(
+            &flapping_slice(false),
+            Some(&with_selector),
+            true,
+            &changes
+        ));
+    }
+
+    // Deleting a slice with recorded nodes reconciles every balancer, which a service
+    // without a robotlb balancer must not cost.
+    #[test]
+    fn slices_of_services_without_a_robotlb_balancer_are_not_observed() {
+        let slice = endpoint_slice("a");
+        for spec in [
+            ServiceSpec {
+                type_: Some("NodePort".to_string()),
+                external_traffic_policy: Some("Local".to_string()),
+                ..Default::default()
+            },
+            ServiceSpec {
+                type_: Some("LoadBalancer".to_string()),
+                load_balancer_class: Some("example.com/other".to_string()),
+                external_traffic_policy: Some("Local".to_string()),
+                ..Default::default()
+            },
+        ] {
+            let changes = live(&slice);
+            assert!(!slice_triggers(
+                &slice,
+                Some(&service(spec)),
+                true,
+                &changes
+            ));
+            assert!(!changes.track(&kube::runtime::watcher::Event::Delete(slice.clone())));
+        }
+    }
+
+    // A node whose target could not be added would otherwise wait for the resync,
+    // since a partly successful reconcile still counts as a success.
+    #[test]
+    fn missing_targets_are_retried_like_an_error() {
+        use std::time::Duration;
+        assert_eq!(success_requeue(true, 300), Duration::from_secs(30));
+        assert_eq!(success_requeue(false, 300), Duration::from_secs(300));
+        assert_eq!(success_requeue(true, 10), Duration::from_secs(10));
     }
 }
