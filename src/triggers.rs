@@ -78,15 +78,6 @@ fn fingerprint(node: &Node) -> u64 {
 
 type SliceKey = (String, String);
 
-/// Which endpoint nodes a service's targets follow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Follows {
-    /// Targets come from the service's pods, which ignore readiness.
-    AllNodes,
-    /// Targets come from the ready endpoints.
-    ReadyNodes,
-}
-
 /// Tells which endpoint slice changes move balancer targets.
 ///
 /// A slice is rewritten on every readiness flip and address change, but only the
@@ -104,21 +95,20 @@ pub struct SliceChanges {
 struct SliceState {
     live: HashSet<SliceKey>,
     relisted: HashSet<SliceKey>,
-    nodes: HashMap<SliceKey, (Follows, BTreeSet<String>)>,
+    nodes: HashMap<SliceKey, BTreeSet<String>>,
 }
 
 impl SliceChanges {
     /// Whether the nodes of the slice changed. A slice the watch does not know to
     /// exist, just created or already deleted, always counts as changed.
-    pub fn observe(&self, slice: &EndpointSlice, follows: Follows) -> bool {
+    pub fn observe(&self, slice: &EndpointSlice) -> bool {
         let key = slice_key(slice);
-        let nodes = slice_nodes(slice, follows);
+        let nodes = slice_nodes(slice);
         let mut state = self.lock();
         if !state.live.contains(&key) {
             return true;
         }
-        let recorded = (follows, nodes);
-        state.nodes.insert(key, recorded.clone()) != Some(recorded)
+        state.nodes.insert(key, nodes.clone()) != Some(nodes)
     }
 
     /// Drop what is known about the slice's nodes, for a service no longer observed.
@@ -143,7 +133,7 @@ impl SliceChanges {
             Event::InitDone => {
                 let live = std::mem::take(&mut state.relisted);
                 let mut dropped_endpoints = false;
-                state.nodes.retain(|key, (_, nodes)| {
+                state.nodes.retain(|key, nodes| {
                     let kept = live.contains(key);
                     dropped_endpoints |= !kept && !nodes.is_empty();
                     kept
@@ -161,7 +151,7 @@ impl SliceChanges {
                 state
                     .nodes
                     .remove(&key)
-                    .is_some_and(|(_, nodes)| !nodes.is_empty())
+                    .is_some_and(|nodes| !nodes.is_empty())
             }
         }
     }
@@ -177,14 +167,23 @@ fn slice_key<K: kube::Resource>(slice: &K) -> SliceKey {
     (slice.namespace().unwrap_or_default(), slice.name_any())
 }
 
-fn slice_nodes(slice: &EndpointSlice, follows: Follows) -> BTreeSet<String> {
+/// The nodes kube-proxy serves the slice's Local traffic from.
+///
+/// These are the nodes with a ready endpoint, or with a terminating one that still
+/// serves, which kube-proxy falls back to while a node has no ready endpoint.
+#[must_use]
+pub fn slice_nodes(slice: &EndpointSlice) -> BTreeSet<String> {
     slice
         .endpoints
         .iter()
-        // The API treats a missing ready condition as ready.
         .filter(|endpoint| {
-            follows == Follows::AllNodes
-                || endpoint.conditions.as_ref().and_then(|c| c.ready) != Some(false)
+            let conditions = endpoint.conditions.as_ref();
+            // kube-proxy reads a missing ready or serving condition as true, and a
+            // missing terminating one as false.
+            let ready = conditions.and_then(|c| c.ready) != Some(false);
+            let serving = conditions.and_then(|c| c.serving) != Some(false);
+            let terminating = conditions.and_then(|c| c.terminating) == Some(true);
+            ready || (serving && terminating)
         })
         .filter_map(|endpoint| endpoint.node_name.clone())
         .collect()
@@ -199,7 +198,7 @@ pub fn slice_service(slice: &EndpointSlice) -> Option<ObjectRef<Service>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{slice_service, Follows, NodeChanges, SliceChanges};
+    use super::{slice_nodes, slice_service, NodeChanges, SliceChanges};
     use k8s_openapi::{
         api::{
             core::v1::{Node, NodeAddress, NodeCondition, NodeSpec, NodeStatus},
@@ -361,77 +360,128 @@ mod tests {
         }
     }
 
-    fn tracked(initial: &EndpointSlice, follows: Follows) -> SliceChanges {
+    fn tracked(initial: &EndpointSlice) -> SliceChanges {
         let changes = SliceChanges::default();
         assert!(!changes.track(&Event::<EndpointSlice>::Init));
         assert!(!changes.track(&Event::InitApply(initial.clone())));
         assert!(!changes.track(&Event::<EndpointSlice>::InitDone));
-        changes.observe(initial, follows);
+        changes.observe(initial);
         changes
     }
 
     #[test]
     fn a_slice_created_after_the_listing_is_tracked_like_a_listed_one() {
-        let changes = tracked(&slice(&[]), Follows::ReadyNodes);
+        let changes = tracked(&slice(&[]));
         let created = slice(&[("10.0.0.1", "a", true)]);
         let mut created = created;
         created.metadata.name = Some("web-fghij".to_string());
         assert!(!changes.track(&Event::Apply(created.clone())));
-        assert!(changes.observe(&created, Follows::ReadyNodes));
-        assert!(!changes.observe(&created, Follows::ReadyNodes));
+        assert!(changes.observe(&created));
+        assert!(!changes.observe(&created));
         assert!(changes.track(&Event::Delete(created)));
     }
 
     #[test]
     fn a_slice_not_known_to_exist_triggers_a_reconcile() {
         let changes = SliceChanges::default();
-        assert!(changes.observe(&slice(&[("10.0.0.1", "a", true)]), Follows::ReadyNodes));
+        assert!(changes.observe(&slice(&[("10.0.0.1", "a", true)])));
     }
 
     // Replicas flapping readiness or changing addresses on the same nodes rewrite the
     // slice all the time, and none of that moves a balancer target.
     #[test]
     fn endpoint_churn_on_the_same_nodes_triggers_nothing() {
-        for follows in [Follows::AllNodes, Follows::ReadyNodes] {
-            let changes = tracked(
-                &slice(&[("10.0.0.1", "a", true), ("10.0.0.2", "a", true)]),
-                follows,
-            );
-            let moved = slice(&[("10.0.0.3", "a", true), ("10.0.0.2", "a", true)]);
-            assert!(!changes.observe(&moved, follows));
-            let flapped = slice(&[("10.0.0.3", "a", false), ("10.0.0.2", "a", true)]);
-            assert!(!changes.observe(&flapped, follows));
-        }
+        let changes = tracked(&slice(&[("10.0.0.1", "a", true), ("10.0.0.2", "a", true)]));
+        let moved = slice(&[("10.0.0.3", "a", true), ("10.0.0.2", "a", true)]);
+        assert!(!changes.observe(&moved));
+        let flapped = slice(&[("10.0.0.3", "a", false), ("10.0.0.2", "a", true)]);
+        assert!(!changes.observe(&flapped));
     }
 
     #[test]
     fn endpoint_targets_follow_the_last_ready_endpoint_of_a_node() {
-        let changes = tracked(&slice(&[("10.0.0.1", "a", true)]), Follows::ReadyNodes);
+        let changes = tracked(&slice(&[("10.0.0.1", "a", true)]));
         let added = slice(&[("10.0.0.1", "a", true), ("10.0.0.2", "b", true)]);
-        assert!(changes.observe(&added, Follows::ReadyNodes));
+        assert!(changes.observe(&added));
         let unready = slice(&[("10.0.0.1", "a", true), ("10.0.0.2", "b", false)]);
-        assert!(changes.observe(&unready, Follows::ReadyNodes));
+        assert!(changes.observe(&unready));
     }
 
-    // Pod-based targets ignore readiness, so a flap costs nothing there, while an
-    // endpoint leaving the slice, terminating or not, moves a target.
+    fn conditions(
+        ready: Option<bool>,
+        serving: Option<bool>,
+        terminating: Option<bool>,
+    ) -> EndpointConditions {
+        EndpointConditions {
+            ready,
+            serving,
+            terminating,
+        }
+    }
+
+    // kube-proxy serves Local traffic from a node's ready endpoints, or from its
+    // terminating ones that still serve when none is ready, and reads a missing
+    // ready or serving condition as true and a missing terminating one as false:
+    // https://github.com/kubernetes/kubernetes/blob/d7c57fb776cbf2554d352a835459194ee62cf751/pkg/proxy/endpointslicecache.go#L209-L211
     #[test]
-    fn pod_targets_ignore_readiness_and_follow_endpoints_leaving() {
-        let both = slice(&[("10.0.0.1", "a", true), ("10.0.0.2", "b", true)]);
-        let changes = tracked(&both, Follows::AllNodes);
-        let unready = slice(&[("10.0.0.1", "a", true), ("10.0.0.2", "b", false)]);
-        assert!(!changes.observe(&unready, Follows::AllNodes));
-        assert!(changes.observe(&slice(&[("10.0.0.1", "a", true)]), Follows::AllNodes));
+    fn nodes_kube_proxy_serves_local_traffic_from_are_targets() {
+        let mut listed = slice(&[]);
+        for (node, conditions) in [
+            ("ready", conditions(Some(true), Some(true), Some(false))),
+            (
+                "not-ready",
+                conditions(Some(false), Some(false), Some(false)),
+            ),
+            ("draining", conditions(Some(false), Some(true), Some(true))),
+            ("drained", conditions(Some(false), Some(false), Some(true))),
+            (
+                "draining-unknown-serving",
+                conditions(Some(false), None, Some(true)),
+            ),
+            (
+                "not-ready-unknown-terminating",
+                conditions(Some(false), Some(true), None),
+            ),
+            ("unknown-ready", conditions(None, None, None)),
+        ] {
+            listed.endpoints.push(Endpoint {
+                addresses: vec!["10.0.0.1".to_string()],
+                node_name: Some(node.to_string()),
+                conditions: Some(conditions),
+                ..Default::default()
+            });
+        }
+        listed.endpoints.push(Endpoint {
+            addresses: vec!["10.0.0.2".to_string()],
+            node_name: Some("no-conditions".to_string()),
+            ..Default::default()
+        });
+        listed.endpoints.push(Endpoint {
+            addresses: vec!["10.0.0.3".to_string()],
+            ..Default::default()
+        });
+        assert_eq!(
+            slice_nodes(&listed),
+            [
+                "ready",
+                "draining",
+                "draining-unknown-serving",
+                "unknown-ready",
+                "no-conditions"
+            ]
+            .map(String::from)
+            .into()
+        );
     }
 
     #[test]
     fn deleting_a_slice_with_endpoints_triggers_a_reconcile_of_everything() {
         let initial = slice(&[("10.0.0.1", "a", true)]);
-        let changes = tracked(&initial, Follows::ReadyNodes);
+        let changes = tracked(&initial);
         assert!(changes.track(&Event::Delete(initial.clone())));
         // The mapper may see the deletion after the watch did; the slice is gone by
         // then, so it reconciles the service rather than recording the slice again.
-        assert!(changes.observe(&initial, Follows::ReadyNodes));
+        assert!(changes.observe(&initial));
         assert!(!changes.track(&Event::Delete(initial)));
     }
 
@@ -440,10 +490,10 @@ mod tests {
     #[test]
     fn a_relisting_forgets_slices_that_are_gone() {
         let initial = slice(&[("10.0.0.1", "a", true)]);
-        let changes = tracked(&initial, Follows::ReadyNodes);
+        let changes = tracked(&initial);
         assert!(!changes.track(&Event::<EndpointSlice>::Init));
         assert!(changes.track(&Event::<EndpointSlice>::InitDone));
-        assert!(changes.observe(&initial, Follows::ReadyNodes));
+        assert!(changes.observe(&initial));
     }
 
     // A service that stops using the Local policy stops being observed, and its old
@@ -451,15 +501,15 @@ mod tests {
     #[test]
     fn a_forgotten_slice_counts_as_changed() {
         let initial = slice(&[("10.0.0.1", "a", true)]);
-        let changes = tracked(&initial, Follows::ReadyNodes);
+        let changes = tracked(&initial);
         changes.forget(&initial);
-        assert!(changes.observe(&initial, Follows::ReadyNodes));
+        assert!(changes.observe(&initial));
     }
 
     #[test]
     fn a_relisting_that_drops_only_empty_slices_triggers_nothing() {
         let empty = slice(&[]);
-        let changes = tracked(&empty, Follows::ReadyNodes);
+        let changes = tracked(&empty);
         assert!(!changes.track(&Event::<EndpointSlice>::Init));
         assert!(!changes.track(&Event::<EndpointSlice>::InitDone));
     }

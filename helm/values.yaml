@@ -34,7 +34,7 @@ serviceAccount:
     resources: [services, services/status]
     verbs: [get, list, patch, update, watch]
   - apiGroups: [""]
-    resources: [nodes, pods]
+    resources: [nodes]
     verbs: [get, list, watch]
   - apiGroups: [discovery.k8s.io]
     resources: [endpointslices]
