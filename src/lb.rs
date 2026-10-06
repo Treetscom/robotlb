@@ -366,9 +366,13 @@ impl LoadBalancer {
             // which must not keep the remaining nodes out of the load balancer.
             match added {
                 Ok(_) => live += 1,
+                // Every further call would be rejected too and only drain the budget.
+                Err(error) if crate::error::is_rate_limit_response(&error) => {
+                    return Err(error.into());
+                }
                 Err(error) => {
                     tracing::warn!("Cannot add target {ip}: {error}");
-                    last_error = Some(error.to_string());
+                    last_error = Some(crate::error::describe(&error));
                 }
             }
         }
@@ -619,16 +623,9 @@ impl LoadBalancer {
                 }),
             },
         )
-        .await;
-        if let Err(e) = response {
-            tracing::error!("Failed to create load balancer: {:?}", e);
-            return Err(RobotLBError::HCloudError(format!(
-                "Failed to create load balancer: {:?}",
-                e
-            )));
-        }
+        .await?;
 
-        Ok(*response.unwrap().load_balancer)
+        Ok(*response.load_balancer)
     }
 
     /// Get the network from Hetzner Cloud.

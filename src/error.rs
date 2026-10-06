@@ -22,65 +22,229 @@ pub enum RobotLBError {
     UnknownLBAlgorithm,
     #[error("Cannot get target nodes, because the service has no selector")]
     ServiceWithoutSelector,
+    #[error("Hetzner Cloud API rate limit reached, the pause ends in {}s", .0.as_millis().div_ceil(1000))]
+    RateLimited(std::time::Duration),
 
     // HCloud API errors
-    #[error("Cannot attach load balancer to a network. Reason: {0}")]
+    #[error("Cannot attach load balancer to a network. Reason: {}", describe(.0))]
     HCloudLBAttachToNetworkError(
         #[from]
         hcloud::apis::Error<hcloud::apis::load_balancers_api::AttachLoadBalancerToNetworkError>,
     ),
-    #[error("Cannot detach load balancer from network. Reason: {0}")]
+    #[error("Cannot detach load balancer from network. Reason: {}", describe(.0))]
     HcloudLBDetachFromNetworkError(
         #[from]
         hcloud::apis::Error<hcloud::apis::load_balancers_api::DetachLoadBalancerFromNetworkError>,
     ),
-    #[error("Cannot add load balancer target. Reason: {0}")]
+    #[error("Cannot add load balancer target. Reason: {}", describe(.0))]
     HcloudLBAddTargetError(
         #[from] hcloud::apis::Error<hcloud::apis::load_balancers_api::AddTargetError>,
     ),
-    #[error("Cannot remove load balancer target. Reason: {0}")]
+    #[error("Cannot remove load balancer target. Reason: {}", describe(.0))]
     HcloudLBRemoveTargetError(
         #[from] hcloud::apis::Error<hcloud::apis::load_balancers_api::RemoveTargetError>,
     ),
-    #[error("Cannot add service to load balancer. Reason: {0}")]
+    #[error("Cannot add service to load balancer. Reason: {}", describe(.0))]
     HcloudLBAddServiceError(
         #[from] hcloud::apis::Error<hcloud::apis::load_balancers_api::AddServiceError>,
     ),
-    #[error("Cannot remove service from load balancer. Reason: {0}")]
+    #[error("Cannot remove service from load balancer. Reason: {}", describe(.0))]
     HcloudLBRemoveServiceError(
         #[from] hcloud::apis::Error<hcloud::apis::load_balancers_api::DeleteServiceError>,
     ),
-    #[error("Cannot create load balancer. Reason: {0}")]
+    #[error("Cannot create load balancer. Reason: {}", describe(.0))]
     HcloudLBCreateError(
         #[from] hcloud::apis::Error<hcloud::apis::load_balancers_api::CreateLoadBalancerError>,
     ),
-    #[error("Cannot delete load balancer. Reason: {0}")]
+    #[error("Cannot delete load balancer. Reason: {}", describe(.0))]
     HcloudLBDeleteError(
         #[from] hcloud::apis::Error<hcloud::apis::load_balancers_api::DeleteLoadBalancerError>,
     ),
-    #[error("Cannot get load balancer. Reason: {0}")]
+    #[error("Cannot get load balancer. Reason: {}", describe(.0))]
     HcloudLBGetError(
         #[from] hcloud::apis::Error<hcloud::apis::load_balancers_api::GetLoadBalancerError>,
     ),
-    #[error("Cannot update service. Reason: {0}")]
+    #[error("Cannot update service. Reason: {}", describe(.0))]
     HcloudLBUpdateServiceError(
         #[from] hcloud::apis::Error<hcloud::apis::load_balancers_api::UpdateServiceError>,
     ),
-    #[error("Cannot change type of load balancer. Reason: {0}")]
+    #[error("Cannot change type of load balancer. Reason: {}", describe(.0))]
     HcloudLBChangeType(
         #[from]
         hcloud::apis::Error<hcloud::apis::load_balancers_api::ChangeTypeOfLoadBalancerError>,
     ),
-    #[error("Cannot change algorithm of load balancer. Reason: {0}")]
+    #[error("Cannot change algorithm of load balancer. Reason: {}", describe(.0))]
     HcloudLBChangeAlgorithm(
         #[from] hcloud::apis::Error<hcloud::apis::load_balancers_api::ChangeAlgorithmError>,
     ),
-    #[error("Cannot list networks. Reason: {0}")]
+    #[error("Cannot list networks. Reason: {}", describe(.0))]
     HcloudListNetworksError(
         #[from] hcloud::apis::Error<hcloud::apis::networks_api::ListNetworksError>,
     ),
-    #[error("Cannot list load balancers. Reason: {0}")]
+    #[error("Cannot list load balancers. Reason: {}", describe(.0))]
     HcloudListLoadBalancersError(
         #[from] hcloud::apis::Error<hcloud::apis::load_balancers_api::ListLoadBalancersError>,
     ),
+}
+
+impl RobotLBError {
+    /// Whether Hetzner rejected the call because the project ran out of API requests.
+    #[must_use]
+    pub fn is_rate_limited(&self) -> bool {
+        // No wildcard arm: a new variant must be sorted into one of the two groups.
+        match self {
+            Self::HCloudLBAttachToNetworkError(error) => is_rate_limit_response(error),
+            Self::HcloudLBDetachFromNetworkError(error) => is_rate_limit_response(error),
+            Self::HcloudLBAddTargetError(error) => is_rate_limit_response(error),
+            Self::HcloudLBRemoveTargetError(error) => is_rate_limit_response(error),
+            Self::HcloudLBAddServiceError(error) => is_rate_limit_response(error),
+            Self::HcloudLBRemoveServiceError(error) => is_rate_limit_response(error),
+            Self::HcloudLBCreateError(error) => is_rate_limit_response(error),
+            Self::HcloudLBDeleteError(error) => is_rate_limit_response(error),
+            Self::HcloudLBGetError(error) => is_rate_limit_response(error),
+            Self::HcloudLBUpdateServiceError(error) => is_rate_limit_response(error),
+            Self::HcloudLBChangeType(error) => is_rate_limit_response(error),
+            Self::HcloudLBChangeAlgorithm(error) => is_rate_limit_response(error),
+            Self::HcloudListNetworksError(error) => is_rate_limit_response(error),
+            Self::HcloudListLoadBalancersError(error) => is_rate_limit_response(error),
+            Self::InvalidNodeFilter(_)
+            | Self::UnsupportedServiceType
+            | Self::SkipService
+            | Self::PaseIntError(_)
+            | Self::PaseBoolError(_)
+            | Self::HCloudError(_)
+            | Self::KubeError(_)
+            | Self::UnknownLBAlgorithm
+            | Self::ServiceWithoutSelector
+            | Self::RateLimited(_) => false,
+        }
+    }
+}
+
+/// Whether Hetzner answered 429 because the project ran out of API requests.
+#[must_use]
+pub fn is_rate_limit_response<T>(error: &hcloud::apis::Error<T>) -> bool {
+    matches!(error, hcloud::apis::Error::ResponseError(response) if response.status.as_u16() == 429)
+}
+
+/// One line with the HTTP status and the error Hetzner reported, if the body carries one.
+#[must_use]
+pub fn describe<T>(error: &hcloud::apis::Error<T>) -> String {
+    let hcloud::apis::Error::ResponseError(response) = error else {
+        return error.to_string();
+    };
+    let body =
+        k8s_openapi::serde_json::from_str::<k8s_openapi::serde_json::Value>(&response.content).ok();
+    let reported = body.as_ref().and_then(|body| {
+        let error = body.get("error")?;
+        Some(format!(
+            "{}: {}",
+            error.get("code")?.as_str()?,
+            error.get("message")?.as_str()?
+        ))
+    });
+    reported.map_or_else(
+        || response.status.to_string(),
+        |reported| {
+            let one_line = reported.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!("{}: {one_line}", response.status)
+        },
+    )
+}
+
+/// Replace the API token, or any prefix of it long enough to identify it, with a marker.
+/// Hetzner quotes the start of the token in some error messages.
+#[must_use]
+pub fn redact(message: &str, token: &str) -> String {
+    const SHORTEST_PREFIX: usize = 8;
+    let mut redacted = message.to_string();
+    for len in (SHORTEST_PREFIX..=token.len()).rev() {
+        if let Some(prefix) = token.get(..len) {
+            redacted = redacted.replace(prefix, "[REDACTED]");
+        }
+    }
+    redacted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{describe, is_rate_limit_response, redact, RobotLBError};
+    use hcloud::apis::{load_balancers_api::ListLoadBalancersError, Error, ResponseContent};
+
+    const TOKEN: &str = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ01";
+
+    fn response_error(status: u16, content: &str) -> Error<ListLoadBalancersError> {
+        Error::ResponseError(ResponseContent {
+            status: status.try_into().unwrap(),
+            content: content.to_string(),
+            entity: None,
+        })
+    }
+
+    #[test]
+    fn a_token_prefix_is_redacted() {
+        let message = format!("limit reached for token {}", &TOKEN[..32]);
+        assert_eq!(
+            redact(&message, TOKEN),
+            "limit reached for token [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn the_whole_token_is_redacted() {
+        assert_eq!(redact(&format!("x{TOKEN}y"), TOKEN), "x[REDACTED]y");
+    }
+
+    #[test]
+    fn a_message_without_the_token_is_kept() {
+        assert_eq!(redact("status 500", TOKEN), "status 500");
+    }
+
+    #[test]
+    fn an_empty_token_redacts_nothing() {
+        assert_eq!(redact("status 500", ""), "status 500");
+    }
+
+    #[test]
+    fn the_hetzner_message_is_described_on_one_line() {
+        let error = response_error(
+            429,
+            r#"{"error": {"code": "rate_limit_exceeded", "message": "limit\n  reached"}}"#,
+        );
+        assert_eq!(
+            describe(&error),
+            "429 Too Many Requests: rate_limit_exceeded: limit reached"
+        );
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_falls_back_to_the_status() {
+        let error = response_error(502, "<html>bad gateway</html>");
+        assert_eq!(describe(&error), "502 Bad Gateway");
+    }
+
+    #[test]
+    fn a_pause_shorter_than_a_second_is_not_reported_as_over() {
+        let error = RobotLBError::RateLimited(std::time::Duration::from_millis(300));
+        assert!(error.to_string().ends_with("in 1s"));
+    }
+
+    #[test]
+    fn a_429_is_a_rate_limit() {
+        let error = RobotLBError::from(response_error(429, ""));
+        assert!(error.is_rate_limited());
+    }
+
+    #[test]
+    fn only_a_429_response_is_a_rate_limit() {
+        assert!(is_rate_limit_response(&response_error(429, "")));
+        // Hetzner answers 422 for a target outside the vSwitch subnet.
+        assert!(!is_rate_limit_response(&response_error(422, "")));
+    }
+
+    #[test]
+    fn other_statuses_are_not_a_rate_limit() {
+        assert!(!RobotLBError::from(response_error(500, "")).is_rate_limited());
+        assert!(!RobotLBError::SkipService.is_rate_limited());
+    }
 }
