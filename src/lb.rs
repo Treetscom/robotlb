@@ -5,15 +5,15 @@ use hcloud::{
             AddServiceParams, AddTargetParams, AttachLoadBalancerToNetworkParams,
             ChangeAlgorithmParams, ChangeTypeOfLoadBalancerParams, DeleteLoadBalancerParams,
             DeleteServiceParams, DetachLoadBalancerFromNetworkParams, ListLoadBalancersParams,
-            RemoveTargetParams, UpdateServiceParams,
+            RemoveTargetParams, ReplaceLoadBalancerParams, UpdateServiceParams,
         },
         networks_api::ListNetworksParams,
     },
     models::{
-        AttachLoadBalancerToNetworkRequest, ChangeTypeOfLoadBalancerRequest, DeleteServiceRequest,
-        DetachLoadBalancerFromNetworkRequest, LoadBalancerAddTarget, LoadBalancerAlgorithm,
-        LoadBalancerService, LoadBalancerServiceHealthCheck, RemoveTargetRequest,
-        UpdateLoadBalancerService,
+        load_balancer_target, AttachLoadBalancerToNetworkRequest, ChangeTypeOfLoadBalancerRequest,
+        DeleteServiceRequest, DetachLoadBalancerFromNetworkRequest, LoadBalancerAddTarget,
+        LoadBalancerAlgorithm, LoadBalancerService, LoadBalancerServiceHealthCheck,
+        RemoveTargetRequest, ReplaceLoadBalancerRequest, UpdateLoadBalancerService,
     },
 };
 use k8s_openapi::api::core::v1::Service;
@@ -40,9 +40,12 @@ enum LBAlgorithm {
 /// Struct representing a load balancer
 /// It holds all the necessary information to manage the load balancer
 /// in Hetzner Cloud.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct LoadBalancer {
     pub name: String,
+    /// The name earlier releases gave the balancer, when it differs from `name`.
+    legacy_name: Option<String>,
+    service_uid: String,
     pub services: HashMap<i32, i32>,
     pub targets: Vec<String>,
     pub private_ip: Option<String>,
@@ -127,11 +130,17 @@ impl LoadBalancer {
             .or(context.config.default_network.as_ref())
             .cloned();
 
-        let name = svc
-            .annotations()
-            .get(consts::LB_NAME_LABEL_NAME)
-            .cloned()
-            .unwrap_or(svc.name_any());
+        let annotated_name = svc.annotations().get(consts::LB_NAME_LABEL_NAME);
+        let legacy_name = annotated_name.is_none().then(|| svc.name_any());
+        let name = annotated_name.cloned().unwrap_or_else(|| {
+            default_name(
+                context.config.cluster_name.as_deref(),
+                &svc.name_any(),
+                &svc.namespace().unwrap_or_default(),
+            )
+        });
+        // The API server sets the UID on every object it stores.
+        let service_uid = svc.uid().ok_or(RobotLBError::SkipService)?;
 
         let private_ip = svc
             .annotations()
@@ -140,6 +149,8 @@ impl LoadBalancer {
 
         Ok(Self {
             name,
+            legacy_name,
+            service_uid,
             private_ip,
             balancer_type,
             check_interval,
@@ -152,6 +163,17 @@ impl LoadBalancer {
             services: HashMap::default(),
             targets: Vec::default(),
             hcloud_config: context.hcloud_config.clone(),
+        })
+    }
+
+    /// A load balancer that is only good for `cleanup`, which finds the balancer by the
+    /// service UID alone. The annotations are not read: one that does not parse must
+    /// not keep the service from being released.
+    pub fn for_release(svc: &Service, hcloud_config: HcloudConfig) -> RobotLBResult<Self> {
+        Ok(Self {
+            service_uid: svc.uid().ok_or(RobotLBError::SkipService)?,
+            hcloud_config,
+            ..Default::default()
         })
     }
 
@@ -171,9 +193,11 @@ impl LoadBalancer {
     }
 
     /// Reconcile the load balancer to match the desired configuration.
-    #[tracing::instrument(skip(self), fields(lb_name=self.name))]
+    #[tracing::instrument(skip(self), fields(lb_name = tracing::field::Empty))]
     pub async fn reconcile(&self) -> RobotLBResult<hcloud::models::LoadBalancer> {
         let hcloud_balancer = self.get_or_create_hcloud_lb().await?;
+        // An adopted balancer keeps its name, which may differ from `self.name`.
+        tracing::Span::current().record("lb_name", hcloud_balancer.name.as_str());
         self.reconcile_algorithm(&hcloud_balancer).await?;
         self.reconcile_lb_type(&hcloud_balancer).await?;
         self.reconcile_network(&hcloud_balancer).await?;
@@ -366,9 +390,13 @@ impl LoadBalancer {
             // which must not keep the remaining nodes out of the load balancer.
             match added {
                 Ok(_) => live += 1,
+                // Every further call would be rejected too and only drain the budget.
+                Err(error) if crate::error::is_rate_limit_response(&error) => {
+                    return Err(error.into());
+                }
                 Err(error) => {
                     tracing::warn!("Cannot add target {ip}: {error}");
-                    last_error = Some(error.to_string());
+                    last_error = Some(crate::error::describe(&error));
                 }
             }
         }
@@ -378,7 +406,7 @@ impl LoadBalancer {
         if !planned.is_empty() && live == 0 {
             return Err(RobotLBError::HCloudError(format!(
                 "No target could be added to load balancer {}: {}",
-                self.name,
+                hcloud_balancer.name,
                 last_error.unwrap_or_else(|| "no reason reported".to_string()),
             )));
         }
@@ -513,46 +541,12 @@ impl LoadBalancer {
         Ok(())
     }
 
-    /// Cleanup the load balancer.
-    /// This method will remove all the services and targets from the
-    /// load balancer.
+    /// Delete the balancer labelled for the service. A balancer is never deleted by
+    /// its name: another service may have created one under it in the meantime.
     pub async fn cleanup(&self) -> RobotLBResult<()> {
-        let Some(hcloud_balancer) = self.get_hcloud_lb().await? else {
+        let Some(hcloud_balancer) = self.find_hcloud_lb(Purpose::Release).await? else {
             return Ok(());
         };
-        for service in &hcloud_balancer.services {
-            tracing::info!(
-                "Deleting service that listens for port {} from load-balancer {}",
-                service.listen_port,
-                hcloud_balancer.name,
-            );
-            hcloud::apis::load_balancers_api::delete_service(
-                &self.hcloud_config,
-                DeleteServiceParams {
-                    id: hcloud_balancer.id,
-                    delete_service_request: Some(DeleteServiceRequest {
-                        listen_port: service.listen_port,
-                    }),
-                },
-            )
-            .await?;
-        }
-        for target in &hcloud_balancer.targets {
-            if let Some(target_ip) = target.ip.clone() {
-                tracing::info!("Removing target {}", target_ip.ip);
-                hcloud::apis::load_balancers_api::remove_target(
-                    &self.hcloud_config,
-                    RemoveTargetParams {
-                        id: hcloud_balancer.id,
-                        remove_target_request: Some(RemoveTargetRequest {
-                            ip: Some(target_ip),
-                            ..Default::default()
-                        }),
-                    },
-                )
-                .await?;
-            }
-        }
         hcloud::apis::load_balancers_api::delete_load_balancer(
             &self.hcloud_config,
             DeleteLoadBalancerParams {
@@ -563,42 +557,92 @@ impl LoadBalancer {
         Ok(())
     }
 
-    /// Get the load balancer from Hetzner Cloud.
-    /// This method will try to find the load balancer with the name
-    /// specified in the `LoadBalancer` struct.
-    ///
-    /// The method might return an error if the load balancer is not found
-    /// or if there are multiple load balancers with the same name.
-    async fn get_hcloud_lb(&self) -> RobotLBResult<Option<hcloud::models::LoadBalancer>> {
-        let hcloud_balancers = hcloud::apis::load_balancers_api::list_load_balancers(
-            &self.hcloud_config,
-            ListLoadBalancersParams {
-                name: Some(self.name.to_string()),
+    /// Find the balancer of the service: the one labelled with its UID, or, when
+    /// reconciling, an unlabelled balancer from an earlier release that it adopts.
+    async fn find_hcloud_lb(
+        &self,
+        purpose: Purpose,
+    ) -> RobotLBResult<Option<hcloud::models::LoadBalancer>> {
+        let selector = owner_selector(&self.service_uid);
+        let labelled = self
+            .list_hcloud_lbs(ListLoadBalancersParams {
+                label_selector: Some(selector.clone()),
                 ..Default::default()
+            })
+            .await?;
+        if let Some(balancer) = single(labelled, &selector)? {
+            return Ok(Some(balancer));
+        }
+        for (name, legacy) in candidate_names(purpose, &self.name, self.legacy_name.as_deref()) {
+            let listed = self
+                .list_hcloud_lbs(ListLoadBalancersParams {
+                    name: Some(name.to_string()),
+                    ..Default::default()
+                })
+                .await?;
+            let Some(balancer) = single(named(listed, name, |lb| &lb.name), name)? else {
+                continue;
+            };
+            match decide(&balancer, &self.service_uid, &self.targets, legacy) {
+                Decision::Use => return Ok(Some(balancer)),
+                Decision::Adopt => return self.adopt(balancer).await.map(Some),
+                Decision::Skip => {
+                    tracing::info!("Load balancer {name} is not this service's, skipping");
+                }
+                Decision::Foreign(owner) => {
+                    return Err(RobotLBError::ForeignBalancer {
+                        name: name.to_string(),
+                        owner,
+                    })
+                }
+                Decision::Unrecognised => {
+                    return Err(RobotLBError::UnrecognisedBalancer {
+                        name: name.to_string(),
+                        uid: self.service_uid.clone(),
+                    })
+                }
+                Decision::NoNodes => {
+                    return Err(RobotLBError::NoNodesToRecogniseBalancer(name.to_string()))
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn list_hcloud_lbs(
+        &self,
+        params: ListLoadBalancersParams,
+    ) -> RobotLBResult<Vec<hcloud::models::LoadBalancer>> {
+        Ok(
+            hcloud::apis::load_balancers_api::list_load_balancers(&self.hcloud_config, params)
+                .await?
+                .load_balancers,
+        )
+    }
+
+    async fn adopt(
+        &self,
+        balancer: hcloud::models::LoadBalancer,
+    ) -> RobotLBResult<hcloud::models::LoadBalancer> {
+        tracing::info!("Adopting load balancer {}", balancer.name);
+        let response = hcloud::apis::load_balancers_api::replace_load_balancer(
+            &self.hcloud_config,
+            ReplaceLoadBalancerParams {
+                id: balancer.id,
+                replace_load_balancer_request: Some(ReplaceLoadBalancerRequest {
+                    labels: Some(owner_labels(&balancer.labels, &self.service_uid)),
+                    name: None,
+                }),
             },
         )
         .await?;
-        if hcloud_balancers.load_balancers.len() > 1 {
-            tracing::warn!(
-                "Found more than one balancer with name {}, skipping",
-                self.name
-            );
-            return Err(RobotLBError::SkipService);
-        }
-        // Here we just return the first load balancer,
-        // if it exists, otherwise we return None
-        Ok(hcloud_balancers.load_balancers.into_iter().next())
+        Ok(*response.load_balancer)
     }
 
-    /// Get or create the load balancer in Hetzner Cloud.
-    ///
-    /// this method will try to find the load balancer with the name
-    /// specified in the `LoadBalancer` struct. If the load balancer
-    /// is not found, the method will create a new load balancer
-    /// with the specified configuration in service's annotations.
+    /// Get or create the load balancer in Hetzner Cloud. A new balancer carries the
+    /// service UID label from the start.
     async fn get_or_create_hcloud_lb(&self) -> RobotLBResult<hcloud::models::LoadBalancer> {
-        let hcloud_lb = self.get_hcloud_lb().await?;
-        if let Some(balancer) = hcloud_lb {
+        if let Some(balancer) = self.find_hcloud_lb(Purpose::Reconcile).await? {
             return Ok(balancer);
         }
 
@@ -607,7 +651,7 @@ impl LoadBalancer {
             hcloud::apis::load_balancers_api::CreateLoadBalancerParams {
                 create_load_balancer_request: Some(hcloud::models::CreateLoadBalancerRequest {
                     algorithm: Some(Box::new(self.algorithm.clone())),
-                    labels: None,
+                    labels: Some(owner_labels(&HashMap::new(), &self.service_uid)),
                     load_balancer_type: self.balancer_type.clone(),
                     location: Some(self.location.clone()),
                     name: self.name.clone(),
@@ -619,16 +663,9 @@ impl LoadBalancer {
                 }),
             },
         )
-        .await;
-        if let Err(e) = response {
-            tracing::error!("Failed to create load balancer: {:?}", e);
-            return Err(RobotLBError::HCloudError(format!(
-                "Failed to create load balancer: {:?}",
-                e
-            )));
-        }
+        .await?;
 
-        Ok(*response.unwrap().load_balancer)
+        Ok(*response.load_balancer)
     }
 
     /// Get the network from Hetzner Cloud.
@@ -648,8 +685,9 @@ impl LoadBalancer {
             },
         )
         .await?;
+        let networks = named(response.networks, &network_name, |network| &network.name);
 
-        if response.networks.len() > 1 {
+        if networks.len() > 1 {
             tracing::warn!(
                 "Found more than one network with name {}, skipping",
                 network_name
@@ -659,7 +697,7 @@ impl LoadBalancer {
                 network_name,
             )));
         }
-        if response.networks.is_empty() {
+        if networks.is_empty() {
             tracing::warn!("Network with name {} not found", network_name);
             return Err(RobotLBError::HCloudError(format!(
                 "Network with name {} not found",
@@ -667,8 +705,150 @@ impl LoadBalancer {
             )));
         }
 
-        Ok(response.networks.into_iter().next())
+        Ok(networks.into_iter().next())
     }
+}
+
+/// Service names, namespaces and the cluster name are DNS labels: at most 63
+/// characters and no dots, so the name cannot be split two ways. Without a cluster
+/// name it fits the 128 Hetzner allows. A longer one is cut and ends in a 64-bit
+/// hash of the whole name, so long names that share the kept part still differ.
+fn default_name(cluster: Option<&str>, service: &str, namespace: &str) -> String {
+    let name = cluster.map_or_else(
+        || format!("{service}.{namespace}"),
+        |cluster| format!("{cluster}.{service}.{namespace}"),
+    );
+    if name.len() <= MAX_NAME_LEN {
+        return name;
+    }
+    // DNS labels are ASCII, so the cut falls on a character boundary.
+    let hash = format!("-{:016x}", fnv1a64(&name));
+    format!("{}{hash}", &name[..MAX_NAME_LEN - hash.len()])
+}
+
+const MAX_NAME_LEN: usize = 128;
+
+/// FNV-1a, 64 bit: the hash ends up in names balancers are looked up by, so it has
+/// to stay the same across releases, which std's hashers do not promise.
+fn fnv1a64(value: &str) -> u64 {
+    value.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// Without dots, the cluster name cannot end in the middle of a `<cluster>.<service>`
+/// prefix of another cluster.
+pub fn parse_cluster_name(value: &str) -> Result<String, String> {
+    let alphanumeric = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let valid = (1..=63).contains(&value.len())
+        && value.chars().all(|c| alphanumeric(c) || c == '-')
+        && value.starts_with(alphanumeric)
+        && value.ends_with(alphanumeric);
+    if valid {
+        Ok(value.to_string())
+    } else {
+        Err("must be a DNS label: 1 to 63 lowercase letters, digits or '-', starting and ending with a letter or digit".to_string())
+    }
+}
+
+fn owner_selector(uid: &str) -> String {
+    format!("{}={uid}", consts::LB_OWNER_LABEL)
+}
+
+/// Hetzner replaces the whole label set of a balancer, so the existing labels go along.
+fn owner_labels(existing: &HashMap<String, String>, uid: &str) -> HashMap<String, String> {
+    let mut labels = existing.clone();
+    labels.insert(consts::LB_OWNER_LABEL.to_string(), uid.to_string());
+    labels
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    Reconcile,
+    Release,
+}
+
+/// Names to look a balancer up by when none carries the service UID, each marked
+/// whether it is the legacy name. A release never goes by name.
+fn candidate_names<'a>(
+    purpose: Purpose,
+    name: &'a str,
+    legacy_name: Option<&'a str>,
+) -> Vec<(&'a str, bool)> {
+    if purpose == Purpose::Release {
+        return vec![];
+    }
+    legacy_name
+        .map(|legacy| (legacy, true))
+        .into_iter()
+        .chain([(name, false)])
+        .collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Decision {
+    Use,
+    Adopt,
+    /// Look for the balancer under the next name.
+    Skip,
+    /// Labelled for the service with this UID.
+    Foreign(String),
+    Unrecognised,
+    /// Unlabelled, and the service has no nodes to compare its targets with.
+    NoNodes,
+}
+
+/// Balancers of earlier releases carry no label. One is taken over only when it looks
+/// like robotlb made it for this service: IP targets only, at least one of them a node
+/// of the service. A balancer of another team or cluster points elsewhere.
+fn decide(
+    balancer: &hcloud::models::LoadBalancer,
+    uid: &str,
+    desired_targets: &[String],
+    legacy: bool,
+) -> Decision {
+    match balancer.labels.get(consts::LB_OWNER_LABEL) {
+        Some(owner) if owner == uid => return Decision::Use,
+        Some(_) if legacy => return Decision::Skip,
+        Some(owner) => return Decision::Foreign(owner.clone()),
+        None => {}
+    }
+    let ip_only = balancer
+        .targets
+        .iter()
+        .all(|target| target.r#type == load_balancer_target::Type::Ip);
+    if ip_only && desired_targets.is_empty() {
+        // Skipping an old balancer here would replace it with a new one and a new
+        // address while the service merely waits for its pods.
+        return Decision::NoNodes;
+    }
+    let on_service_nodes = balancer.targets.iter().any(|target| {
+        target
+            .ip
+            .as_ref()
+            .is_some_and(|ip| desired_targets.contains(&ip.ip))
+    });
+    if ip_only && on_service_nodes {
+        Decision::Adopt
+    } else if legacy {
+        Decision::Skip
+    } else {
+        Decision::Unrecognised
+    }
+}
+
+/// The API matches a name filter exactly, except that it ignores an empty one and
+/// returns everything in the project.
+fn named<T>(mut found: Vec<T>, name: &str, name_of: impl Fn(&T) -> &str) -> Vec<T> {
+    found.retain(|item| name_of(item) == name);
+    found
+}
+
+fn single<T>(mut found: Vec<T>, what: &str) -> RobotLBResult<Option<T>> {
+    if found.len() > 1 {
+        return Err(RobotLBError::AmbiguousBalancer(what.to_string()));
+    }
+    Ok(found.pop())
 }
 
 /// The targets a balancer should end up with: deduplicated, and trimmed to what the
@@ -707,7 +887,18 @@ impl From<LBAlgorithm> for LoadBalancerAlgorithm {
 
 #[cfg(test)]
 mod tests {
-    use super::plan_targets;
+    use super::{
+        candidate_names, decide, default_name, fnv1a64, named, owner_labels, owner_selector,
+        parse_cluster_name, plan_targets, single, Decision, LoadBalancer, Purpose,
+    };
+    use crate::{consts, error::RobotLBError};
+    use hcloud::apis::configuration::Configuration as HcloudConfig;
+    use hcloud::models::{
+        load_balancer_target, LoadBalancer as HcloudBalancer, LoadBalancerTarget,
+        LoadBalancerTargetIp, Network,
+    };
+    use k8s_openapi::{api::core::v1::Service, apimachinery::pkg::apis::meta::v1::ObjectMeta};
+    use std::collections::HashMap;
 
     #[test]
     fn targets_are_sorted_and_deduplicated() {
@@ -737,5 +928,337 @@ mod tests {
     fn a_plan_within_the_limit_keeps_every_target() {
         let desired = vec!["192.168.100.2".to_string(), "192.168.100.3".to_string()];
         assert_eq!(plan_targets(&desired, 25).len(), 2);
+    }
+
+    #[test]
+    fn the_default_name_carries_the_namespace() {
+        assert_eq!(default_name(None, "web", "shop"), "web.shop");
+        assert_ne!(
+            default_name(None, "web", "shop"),
+            default_name(None, "web", "blog")
+        );
+    }
+
+    // Both parts are DNS labels of at most 63 characters, Hetzner takes 128.
+    #[test]
+    fn the_longest_default_name_fits_hetzner() {
+        let part = "a".repeat(63);
+        assert_eq!(default_name(None, &part, &part).len(), 127);
+    }
+
+    #[test]
+    fn the_default_name_starts_with_the_cluster_name() {
+        assert_eq!(default_name(Some("prod"), "web", "shop"), "prod.web.shop");
+    }
+
+    #[test]
+    fn a_long_default_name_is_cut_to_the_limit_and_hashed() {
+        let part = "a".repeat(63);
+        let full = format!("{part}.{part}.{part}");
+        let name = default_name(Some(&part), &part, &part);
+        assert_eq!(name.len(), 128);
+        assert_eq!(name, format!("{}-{:016x}", &full[..111], fnv1a64(&full)));
+        assert_eq!(name.trim(), name);
+    }
+
+    #[test]
+    fn a_default_name_of_128_characters_is_kept_and_one_of_129_is_cut() {
+        let cluster = "a".repeat(63);
+        let service = "b".repeat(62);
+        let kept = default_name(Some(&cluster), &service, "c");
+        assert_eq!(kept, format!("{cluster}.{service}.c"));
+        assert_eq!(kept.len(), 128);
+        let full = format!("{cluster}.{service}.cc");
+        let cut = default_name(Some(&cluster), &service, "cc");
+        assert_eq!(cut, format!("{}-{:016x}", &full[..111], fnv1a64(&full)));
+    }
+
+    #[test]
+    fn long_default_names_differing_after_the_cut_stay_different() {
+        let part = "a".repeat(63);
+        assert_ne!(
+            default_name(Some(&part), &part, &"b".repeat(63)),
+            default_name(Some(&part), &part, &"c".repeat(63)),
+        );
+    }
+
+    // The hash is part of a name balancers are looked up by, it must never change.
+    #[test]
+    fn the_name_hash_is_fnv1a_64() {
+        assert_eq!(fnv1a64(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64("a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64("foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn the_owner_selector_matches_the_service_uid() {
+        assert_eq!(owner_selector("uid-1"), "robotlb/service-uid=uid-1");
+    }
+
+    // Hetzner replaces the whole label set, so labels set by others must be sent back.
+    #[test]
+    fn owner_labels_keep_existing_labels() {
+        let existing = HashMap::from([
+            ("team".to_string(), "web".to_string()),
+            (consts::LB_OWNER_LABEL.to_string(), "uid-2".to_string()),
+        ]);
+        let labels = owner_labels(&existing, "uid-1");
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels["team"], "web");
+        assert_eq!(labels[consts::LB_OWNER_LABEL], "uid-1");
+    }
+
+    fn ip_target(ip: &str) -> LoadBalancerTarget {
+        LoadBalancerTarget {
+            r#type: load_balancer_target::Type::Ip,
+            ip: Some(Box::new(LoadBalancerTargetIp { ip: ip.to_string() })),
+            ..Default::default()
+        }
+    }
+
+    fn balancer(owner: Option<&str>, targets: Vec<LoadBalancerTarget>) -> HcloudBalancer {
+        HcloudBalancer {
+            labels: owner
+                .map(|uid| HashMap::from([(consts::LB_OWNER_LABEL.to_string(), uid.to_string())]))
+                .unwrap_or_default(),
+            targets,
+            ..Default::default()
+        }
+    }
+
+    fn nodes() -> Vec<String> {
+        vec!["192.0.2.1".to_string(), "192.0.2.2".to_string()]
+    }
+
+    #[test]
+    fn a_balancer_labelled_for_the_service_is_used() {
+        let lb = balancer(Some("uid-1"), vec![]);
+        assert_eq!(decide(&lb, "uid-1", &nodes(), true), Decision::Use);
+        assert_eq!(decide(&lb, "uid-1", &nodes(), false), Decision::Use);
+    }
+
+    #[test]
+    fn a_balancer_labelled_for_another_service_is_never_taken() {
+        let lb = balancer(Some("uid-2"), vec![ip_target("192.0.2.1")]);
+        assert_eq!(decide(&lb, "uid-1", &nodes(), true), Decision::Skip);
+        assert_eq!(
+            decide(&lb, "uid-1", &nodes(), false),
+            Decision::Foreign("uid-2".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unlabelled_balancer_on_the_service_nodes_is_adopted() {
+        let lb = balancer(None, vec![ip_target("192.0.2.9"), ip_target("192.0.2.2")]);
+        assert_eq!(decide(&lb, "uid-1", &nodes(), true), Decision::Adopt);
+        assert_eq!(decide(&lb, "uid-1", &nodes(), false), Decision::Adopt);
+    }
+
+    #[test]
+    fn an_unlabelled_balancer_elsewhere_is_not_adopted() {
+        let lb = balancer(None, vec![ip_target("198.51.100.1")]);
+        assert_eq!(decide(&lb, "uid-1", &nodes(), true), Decision::Skip);
+        assert_eq!(
+            decide(&lb, "uid-1", &nodes(), false),
+            Decision::Unrecognised
+        );
+        let empty = balancer(None, vec![]);
+        assert_eq!(decide(&empty, "uid-1", &nodes(), true), Decision::Skip);
+    }
+
+    // robotlb only ever adds IP targets.
+    #[test]
+    fn an_unlabelled_balancer_with_server_targets_is_not_adopted() {
+        let server = LoadBalancerTarget {
+            r#type: load_balancer_target::Type::Server,
+            ..Default::default()
+        };
+        let lb = balancer(None, vec![ip_target("192.0.2.1"), server]);
+        assert_eq!(
+            decide(&lb, "uid-1", &nodes(), false),
+            Decision::Unrecognised
+        );
+        // No node could make it robotlb's, so a service without nodes need not wait.
+        assert_eq!(decide(&lb, "uid-1", &[], true), Decision::Skip);
+    }
+
+    #[test]
+    fn an_unlabelled_balancer_is_not_skipped_while_the_service_has_no_nodes() {
+        let lb = balancer(None, vec![ip_target("192.0.2.1")]);
+        assert_eq!(decide(&lb, "uid-1", &[], true), Decision::NoNodes);
+        assert_eq!(decide(&lb, "uid-1", &[], false), Decision::NoNodes);
+    }
+
+    #[test]
+    fn a_release_never_looks_a_balancer_up_by_name() {
+        assert!(candidate_names(Purpose::Release, "web.shop", Some("web")).is_empty());
+        assert_eq!(
+            candidate_names(Purpose::Reconcile, "web.shop", Some("web")),
+            vec![("web", true), ("web.shop", false)]
+        );
+        assert_eq!(
+            candidate_names(Purpose::Reconcile, "custom", None),
+            vec![("custom", false)]
+        );
+    }
+
+    #[test]
+    fn only_balancers_with_exactly_the_name_are_kept() {
+        let found = ["web", "Web", "web ", "web.shop"]
+            .map(|name| HcloudBalancer {
+                name: name.to_string(),
+                ..Default::default()
+            })
+            .to_vec();
+        let kept = named(found.clone(), "web", |lb| &lb.name);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name, "web");
+        // The API ignores an empty name filter and returns every balancer.
+        assert!(named(found, "", |lb| &lb.name).is_empty());
+    }
+
+    #[test]
+    fn only_networks_with_exactly_the_name_are_kept() {
+        let found = ["lan", "LAN", "lan ", "lan2"]
+            .map(|name| Network {
+                name: name.to_string(),
+                ..Default::default()
+            })
+            .to_vec();
+        let kept = named(found.clone(), "lan", |network| &network.name);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name, "lan");
+        assert!(named(found, "", |network| &network.name).is_empty());
+    }
+
+    #[test]
+    fn more_than_one_match_is_an_error() {
+        assert!(single(Vec::<i32>::new(), "x").unwrap().is_none());
+        assert_eq!(single(vec![1], "x").unwrap(), Some(1));
+        assert!(matches!(
+            single(vec![1, 2], "x"),
+            Err(RobotLBError::AmbiguousBalancer(_))
+        ));
+    }
+    #[test]
+    fn a_release_ignores_annotations_that_do_not_parse() {
+        let svc = Service {
+            metadata: ObjectMeta {
+                uid: Some("uid-1".to_string()),
+                annotations: Some(
+                    [(consts::LB_RETRIES_ANN_NAME.to_string(), "abc".to_string())].into(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let lb = LoadBalancer::for_release(&svc, HcloudConfig::default()).unwrap();
+        assert_eq!(lb.service_uid, "uid-1");
+    }
+
+    fn context_with_cluster_name() -> crate::CurrentContext {
+        use clap::Parser;
+        let config = crate::config::OperatorConfig::try_parse_from([
+            "robotlb",
+            "--hcloud-token",
+            "t",
+            "--cluster-name",
+            "prod",
+        ])
+        .unwrap();
+        let client =
+            kube::Client::try_from(kube::Config::new("http://127.0.0.1:1".parse().unwrap()))
+                .unwrap();
+        crate::CurrentContext::new(client, config, HcloudConfig::default())
+    }
+
+    #[tokio::test]
+    async fn the_cluster_name_prefixes_the_default_name() {
+        let svc = Service {
+            metadata: ObjectMeta {
+                uid: Some("uid-1".to_string()),
+                name: Some("web".to_string()),
+                namespace: Some("shop".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let lb = LoadBalancer::try_from_svc(&svc, &context_with_cluster_name()).unwrap();
+        assert_eq!(lb.name, "prod.web.shop");
+    }
+
+    #[tokio::test]
+    async fn the_cluster_name_leaves_an_annotated_name_alone() {
+        let annotated = "a".repeat(128);
+        let svc = Service {
+            metadata: ObjectMeta {
+                uid: Some("uid-1".to_string()),
+                name: Some("web".to_string()),
+                namespace: Some("shop".to_string()),
+                annotations: Some(
+                    [(consts::LB_NAME_LABEL_NAME.to_string(), annotated.clone())].into(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let lb = LoadBalancer::try_from_svc(&svc, &context_with_cluster_name()).unwrap();
+        assert_eq!(lb.name, annotated);
+    }
+
+    fn parse_cluster_name_arg(
+        cluster_name: &str,
+    ) -> Result<crate::config::OperatorConfig, clap::Error> {
+        use clap::Parser;
+        crate::config::OperatorConfig::try_parse_from([
+            "robotlb".to_string(),
+            "--hcloud-token=t".to_string(),
+            format!("--cluster-name={cluster_name}"),
+        ])
+    }
+
+    #[test]
+    fn the_cluster_name_is_unset_by_default() {
+        use clap::Parser;
+        let config =
+            crate::config::OperatorConfig::try_parse_from(["robotlb", "--hcloud-token", "t"])
+                .unwrap();
+        assert_eq!(config.cluster_name, None);
+    }
+
+    #[test]
+    fn a_dns_label_is_a_valid_cluster_name() {
+        for name in ["a", "prod", "eu-1", "0", &"a".repeat(63)] {
+            assert_eq!(parse_cluster_name(name).as_deref(), Ok(name));
+            assert_eq!(
+                parse_cluster_name_arg(name)
+                    .unwrap()
+                    .cluster_name
+                    .as_deref(),
+                Some(name)
+            );
+        }
+    }
+
+    #[test]
+    fn a_cluster_name_that_is_not_a_dns_label_is_rejected() {
+        for name in [
+            "",
+            "Prod",
+            "eu.prod",
+            "-prod",
+            "prod-",
+            "pr_od",
+            "prød",
+            &"a".repeat(64),
+        ] {
+            assert!(parse_cluster_name(name).is_err(), "{name:?}");
+            let error = parse_cluster_name_arg(name).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{name:?}"
+            );
+        }
     }
 }

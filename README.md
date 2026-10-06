@@ -46,9 +46,25 @@ Setting `ROBOTLB_DYNAMIC_NODE_SELECTOR` to `false` replaces both with the node s
 
 A balancer type caps how many targets it holds: `lb11`, the default type, holds 25. When more nodes are selected than the type holds, the extra ones are dropped in a stable order and a warning names the limit. Pick a bigger type through `ROBOTLB_DEFAULT_LB_TYPE` or the `robotlb/balancer-type` annotation to use the whole cluster.
 
-Every port of the service needs an allocated `nodePort`. A Hetzner load balancer forwards traffic to the IP of a node, so a port is reachable only through its `nodePort`: ports without one are skipped, and `allocateLoadBalancerNodePorts: false` is not supported. When no port of a service can be exposed, no balancer is created for it, and a service that already advertises an external IP loses it.
+robotlb labels every balancer it creates with `robotlb/service-uid` set to the UID of the service, finds the balancer of a service by that label, and changes or deletes only a balancer labelled for that service. A balancer is never deleted by its name. Without the `robotlb/balancer` annotation the balancer is named `<service>.<namespace>`, or `<cluster>.<service>.<namespace>` when `ROBOTLB_CLUSTER_NAME` is set, so that clusters sharing a Hetzner project do not pick the same name. A name longer than the 128 characters Hetzner allows is cut and ends in `-` and a 16-digit hex hash of the whole name. The cluster name is not added to a name from the annotation. Balancers that already carry the `robotlb/service-uid` label are found by it, so setting a cluster name later does not rename them. The name is only used to create the balancer: changing the annotation later does not rename it. When the name is taken by a balancer labelled for another service, or by an unlabelled balancer that does not target the nodes of the service, robotlb leaves that balancer alone and reports it in a warning event on the service. Two services therefore cannot share a balancer through the same `robotlb/balancer` annotation: the second one gets the warning. A service recreated with a new UID, for example restored from a backup, is another service to robotlb, because its old balancer is labelled with the old UID. When that balancer has the name the service asks for, the warning names the old UID. When it has the name of an earlier release, robotlb creates a new balancer with a new IP instead, without a warning, and the old one stays in the project and keeps being billed; `hcloud load-balancer list --selector robotlb/service-uid=<old UID>` finds it. After checking that no service with the old UID is left, hand the balancer over with `hcloud load-balancer add-label --overwrite '<balancer>' robotlb/service-uid=<new UID>`, or delete it. An unlabelled balancer whose targets are all IPs, at least one of them a node of the service, is adopted: robotlb adds its label, keeps the name, and from then on manages and deletes it like its own. This is how balancers of earlier releases are taken over, and it applies to any balancer created later under that name that matches.
+
+Every port of the service needs an allocated `nodePort`. A Hetzner load balancer forwards traffic to the IP of a node, so a port is reachable only through its `nodePort`: ports without one are skipped, and `allocateLoadBalancerNodePorts: false` is not supported. When no port of a service can be exposed, no balancer is created for it, an existing balancer and the service's external IP are kept as they are, and a warning event on the service reports the problem.
 
 > Earlier releases treated every service as if it had the `Local` policy. Services that leave `externalTrafficPolicy` unset therefore get the full node list on upgrade, which changes the targets of their existing balancers.
+
+> Earlier releases created balancers without a label and named them after the service without its namespace. On the first reconcile after the upgrade, a service with no labelled balancer adopts the balancer under its old name, or under the name from its `robotlb/balancer` annotation, if every target of that balancer is an IP and at least one of them is a node of the service: robotlb adds its label and keeps the name. Otherwise the balancer is left alone: under the old name robotlb creates a new balancer with a new IP under `<service>.<namespace>`, under an annotated name the service gets a warning event instead. Services with the same name in different namespaces used to share one balancer: one of them keeps it, the others get a new balancer and a new IP. When they reconcile at the same moment, the others may configure the shared balancer and report its address once more before they get their own. A balancer without targets, for example because Hetzner refused every node, does not look like the service's. Under the old name it is replaced by a new balancer with a new IP and stays in the project, unlabelled and billed; under an annotated name the service gets a warning event. To hand an unlabelled balancer to a service yourself, label it: `hcloud load-balancer add-label '<balancer>' robotlb/service-uid=<service UID>`. While a service has no target nodes, for example a `Local` service without ready pods, robotlb cannot tell whether an unlabelled balancer is its own, so it waits and reports that in a warning event.
+>
+> A balancer is deleted only when it carries the label, so the balancer of a service deleted or changed from `LoadBalancer` before its first successful reconcile on this release stays in the project: a reconcile that stops early, for example because the service has no port to expose or no target nodes, adopts nothing. This includes services that earlier releases kept a balancer for after their type changed from `LoadBalancer` or they moved to another load balancer class: they still carry the `robotlb/finalizer` finalizer, robotlb removes it on the first start, and their balancers stay. List the balancers without the label, check which of them are still used, and delete the rest:
+>
+> ```bash
+> hcloud load-balancer list --selector '!robotlb/service-uid'
+> ```
+>
+> The services that lose their finalizer this way can be listed before the upgrade:
+>
+> ```bash
+> kubectl get services --all-namespaces --output json | jq --raw-output '.items[] | select(((.metadata.finalizers // []) | index("robotlb/finalizer")) and (.spec.type != "LoadBalancer" or (.spec.loadBalancerClass // "robotlb") != "robotlb")) | "\(.metadata.namespace)/\(.metadata.name)"'
+> ```
 
 
 ## Configuration
@@ -67,6 +83,8 @@ Usage: robotlb [OPTIONS] --hcloud-token <HCLOUD_TOKEN>
 Options:
   -t, --hcloud-token <HCLOUD_TOKEN>
           `HCloud` API token [env: ROBOTLB_HCLOUD_TOKEN=]
+      --cluster-name <CLUSTER_NAME>
+          Name of the cluster, put in front of default balancer names so that clusters sharing a Hetzner project do not pick the same ones. A DNS label: lowercase letters, digits and `-`, at most 63 characters [env: ROBOTLB_CLUSTER_NAME=]
       --default-network <DEFAULT_NETWORK>
           Default network to use for load balancers. If not set, then only network from the service annotation will be used [env: ROBOTLB_DEFAULT_NETWORK=]
       --dynamic-node-selector
@@ -103,7 +121,7 @@ kind: Service
 metadata:
   name: target
   annotations:
-    # Custom name of the balancer to create on Hetzner. Defaults to service name.
+    # Name of the balancer to create on Hetzner. Defaults to <service>.<namespace>.
     robotlb/balancer: "custom name"
     # Hetzner cloud network. If this annotation is missing, the operator will try to
     # assign external IPs to the load balancer if available. Otherwise, the update won't happen.

@@ -18,7 +18,7 @@
 
 use clap::Parser;
 use config::OperatorConfig;
-use error::{RobotLBError, RobotLBResult};
+use error::{redact, RobotLBError, RobotLBResult};
 use futures::StreamExt;
 use hcloud::apis::configuration::Configuration as HCloudConfig;
 use k8s_openapi::{
@@ -30,12 +30,22 @@ use k8s_openapi::{
 };
 use kube::{
     api::{ListParams, PatchParams},
-    runtime::{controller::Action, watcher, Controller},
+    runtime::{
+        controller::{self, Action},
+        events::{Event, EventType, Recorder, Reporter},
+        watcher, Controller,
+    },
     Resource, ResourceExt,
 };
 use label_filter::LabelFilter;
 use lb::{LBService, LoadBalancer};
-use std::{collections::HashSet, str::FromStr, sync::Arc, time::Duration};
+use rate_limit::{spread, RateLimitGate};
+use std::{
+    collections::HashSet,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 pub mod config;
 pub mod consts;
@@ -43,6 +53,7 @@ pub mod error;
 pub mod finalizers;
 pub mod label_filter;
 pub mod lb;
+pub mod rate_limit;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -69,27 +80,38 @@ async fn main() -> RobotLBResult<()> {
         hcloud_conf,
     ));
     tracing::info!("Starting the controller");
+    let token = operator_config.hcloud_token;
     Controller::new(
         kube::Api::<Service>::all(kube_client),
         watcher::Config::default(),
     )
     .run(reconcile_service, on_error, context)
-    .for_each(|reconcilation_result| async move {
-        match reconcilation_result {
-            Ok((service, _action)) => {
-                tracing::info!("Reconcilation of a service {} was successful", service.name);
-            }
-            Err(err) => match err {
+    .for_each(|reconcilation_result| {
+        let token = token.clone();
+        async move {
+            match reconcilation_result {
+                Ok((service, _action)) => {
+                    tracing::info!("Reconcilation of a service {} was successful", service.name);
+                }
                 // During reconcilation process,
                 // the controller has decided to skip the service.
-                kube::runtime::controller::Error::ReconcilerFailed(
-                    RobotLBError::SkipService,
-                    _,
-                ) => {}
-                _ => {
-                    tracing::error!("Error reconciling service: {:#?}", err);
+                Err(controller::Error::ReconcilerFailed(RobotLBError::SkipService, _)) => {}
+                Err(controller::Error::ReconcilerFailed(
+                    error @ RobotLBError::RateLimited(_),
+                    service,
+                )) => {
+                    tracing::info!("Service {service}: {error}");
                 }
-            },
+                Err(controller::Error::ReconcilerFailed(error, service)) => {
+                    tracing::error!(
+                        "Reconcilation of service {service} failed: {}",
+                        redact(&error.to_string(), &token)
+                    );
+                }
+                Err(error) => {
+                    tracing::error!("Controller error: {}", redact(&error.to_string(), &token));
+                }
+            }
         }
     })
     .await;
@@ -101,18 +123,16 @@ pub struct CurrentContext {
     pub client: kube::Client,
     pub config: OperatorConfig,
     pub hcloud_config: HCloudConfig,
+    pub rate_limit: Arc<RateLimitGate>,
 }
 impl CurrentContext {
     #[must_use]
-    pub const fn new(
-        client: kube::Client,
-        config: OperatorConfig,
-        hcloud_config: HCloudConfig,
-    ) -> Self {
+    pub fn new(client: kube::Client, config: OperatorConfig, hcloud_config: HCloudConfig) -> Self {
         Self {
             client,
             config,
             hcloud_config,
+            rate_limit: Arc::default(),
         }
     }
 }
@@ -127,35 +147,123 @@ pub async fn reconcile_service(
     svc: Arc<Service>,
     context: Arc<CurrentContext>,
 ) -> RobotLBResult<Action> {
-    let svc_type = svc
+    let result = sync_service(svc.clone(), context.clone()).await;
+    if let Err(error) = &result {
+        if publishes_event(error) {
+            report_failure(&svc, &context, error).await;
+        }
+    }
+    result
+}
+
+/// Skipped services are every service robotlb does not own. A service waiting at the
+/// rate limit gate still gets an event each time it wakes up to a closed gate.
+const fn publishes_event(error: &RobotLBError) -> bool {
+    !matches!(error, RobotLBError::SkipService)
+}
+
+/// Put the error on the service as a warning event, where `kubectl describe` shows it.
+async fn report_failure(svc: &Service, context: &CurrentContext, error: &RobotLBError) {
+    let recorder = Recorder::new(
+        context.client.clone(),
+        Reporter {
+            controller: "robotlb".to_string(),
+            instance: None,
+        },
+        svc.object_ref(&()),
+    );
+    let published = recorder
+        .publish(Event {
+            type_: EventType::Warning,
+            reason: "SyncLoadBalancerFailed".to_string(),
+            note: Some(event_note(error, &context.config.hcloud_token)),
+            action: "Reconcile".to_string(),
+            secondary: None,
+        })
+        .await;
+    if let Err(publish_error) = published {
+        tracing::warn!("Cannot publish an event for the service: {publish_error}");
+    }
+}
+
+/// The error as an event note: token redacted and cut to the size the API accepts.
+fn event_note(error: &RobotLBError, token: &str) -> String {
+    const MAX_NOTE_BYTES: usize = 1024;
+    let mut note = redact(&error.to_string(), token);
+    if note.len() > MAX_NOTE_BYTES {
+        let mut end = MAX_NOTE_BYTES;
+        while !note.is_char_boundary(end) {
+            end -= 1;
+        }
+        note.truncate(end);
+    }
+    note
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ServiceRole {
+    /// The service is not robotlb's.
+    Skip,
+    /// The service needs its load balancer created or updated.
+    Reconcile,
+    /// The service had a load balancer and no longer needs it.
+    Release,
+}
+
+/// The API server wipes `loadBalancerClass` together with the `LoadBalancer` type,
+/// so once the type changes only the finalizer still marks the service as robotlb's,
+/// and a service with the finalizer that robotlb no longer serves gets released.
+fn service_role(svc: &Service) -> ServiceRole {
+    let is_load_balancer =
+        svc.spec.as_ref().and_then(|s| s.type_.as_deref()) == Some("LoadBalancer");
+    let class = svc
         .spec
         .as_ref()
-        .and_then(|s| s.type_.as_ref())
-        .map(String::as_str)
-        .unwrap_or("ClusterIP");
-    if svc_type != "LoadBalancer" {
-        tracing::debug!("Service type is not LoadBalancer. Skipping...");
+        .and_then(|s| s.load_balancer_class.as_deref())
+        .unwrap_or(consts::ROBOTLB_LB_CLASS);
+    let is_robotlb = is_load_balancer && class == consts::ROBOTLB_LB_CLASS;
+    let owned = finalizers::check(svc);
+    let deleting = svc.meta().deletion_timestamp.is_some();
+    if (deleting && is_robotlb) || (owned && !is_robotlb) {
+        ServiceRole::Release
+    } else if is_robotlb && !deleting {
+        ServiceRole::Reconcile
+    } else {
+        ServiceRole::Skip
+    }
+}
+
+fn balancer_for(
+    role: &ServiceRole,
+    svc: &Service,
+    context: &CurrentContext,
+) -> RobotLBResult<LoadBalancer> {
+    if *role == ServiceRole::Release {
+        LoadBalancer::for_release(svc, context.hcloud_config.clone())
+    } else {
+        LoadBalancer::try_from_svc(svc, context)
+    }
+}
+
+async fn sync_service(svc: Arc<Service>, context: Arc<CurrentContext>) -> RobotLBResult<Action> {
+    let role = service_role(&svc);
+    if role == ServiceRole::Skip {
+        tracing::debug!("Service is not a robotlb load balancer. Skipping...");
         return Err(RobotLBError::SkipService);
     }
 
-    let lb_type = svc
-        .spec
-        .as_ref()
-        .and_then(|s| s.load_balancer_class.as_ref())
-        .map(String::as_str)
-        .unwrap_or(consts::ROBOTLB_LB_CLASS);
-    if lb_type != consts::ROBOTLB_LB_CLASS {
-        tracing::debug!("Load balancer class is not robotlb. Skipping...");
-        return Err(RobotLBError::SkipService);
+    // Hetzner counts requests per project, so while one service is rate limited
+    // every other one waits too instead of spending the budget being waited for.
+    if let Some(wait) = context.rate_limit.remaining(Instant::now()) {
+        return Err(RobotLBError::RateLimited(wait));
     }
 
     tracing::info!("Starting service reconcilation");
 
-    let lb = LoadBalancer::try_from_svc(&svc, &context)?;
+    let lb = balancer_for(&role, &svc, &context)?;
 
-    // If the service is being deleted, we need to clean up the resources.
-    if svc.meta().deletion_timestamp.is_some() {
-        tracing::info!("Service deletion detected. Cleaning up resources.");
+    if role == ServiceRole::Release {
+        tracing::info!("Service no longer needs a load balancer. Cleaning up resources.");
         lb.cleanup().await?;
         finalizers::remove(context.client.clone(), &svc).await?;
         return Ok(Action::await_change());
@@ -437,22 +545,22 @@ pub async fn reconcile_load_balancer(
         lb.add_service(service.listen_port, service.target_port);
     }
 
+    // A balancer without a single service forwards nothing while still being billed,
+    // so none is created until the service has a port that can be exposed.
+    // An existing balancer and the address it gave the service are kept: a missing
+    // nodePort is far more likely a mistake than a request to delete the balancer.
+    if lb.services.is_empty() {
+        return Err(RobotLBError::NoExposablePorts);
+    }
+
+    let hcloud_lb = lb.reconcile().await?;
+
     let svc_api = kube::Api::<Service>::namespaced(
         context.client.clone(),
         svc.namespace()
             .unwrap_or_else(|| context.client.default_namespace().to_string())
             .as_str(),
     );
-
-    // A balancer without a single service forwards nothing while still being billed,
-    // so none is created until the service has a port that can be exposed.
-    if lb.services.is_empty() {
-        tracing::warn!("Service has no port that can be exposed. Skipping the load balancer.");
-        clear_ingress_status(&svc_api, &svc).await?;
-        return Ok(Action::requeue(Duration::from_secs(30)));
-    }
-
-    let hcloud_lb = lb.reconcile().await?;
 
     let mut ingress = vec![];
 
@@ -496,40 +604,25 @@ pub async fn reconcile_load_balancer(
     Ok(Action::requeue(Duration::from_secs(30)))
 }
 
-/// Drop the external IP a service advertises, so that nothing keeps sending
-/// traffic to a load balancer that no longer forwards it.
-async fn clear_ingress_status(svc_api: &kube::Api<Service>, svc: &Service) -> RobotLBResult<()> {
-    let advertises_ingress = svc
-        .status
-        .as_ref()
-        .and_then(|status| status.load_balancer.as_ref())
-        .and_then(|lb| lb.ingress.as_ref())
-        .is_some_and(|ingress| !ingress.is_empty());
-    if !advertises_ingress {
-        return Ok(());
-    }
-    tracing::info!("Removing the external IP from the service status");
-    svc_api
-        .patch_status(
-            svc.name_any().as_str(),
-            &PatchParams::default(),
-            &kube::api::Patch::Merge(json!({
-                "status": {
-                    "loadBalancer": {
-                        "ingress": null
-                    }
-                }
-            })),
-        )
-        .await?;
-    Ok(())
-}
-
 /// Handle the error during reconcilation.
 #[allow(clippy::needless_pass_by_value)]
-fn on_error(_: Arc<Service>, error: &RobotLBError, _context: Arc<CurrentContext>) -> Action {
+fn on_error(svc: Arc<Service>, error: &RobotLBError, context: Arc<CurrentContext>) -> Action {
+    let service = format!("{}/{}", svc.namespace().unwrap_or_default(), svc.name_any());
+    error_action(error, &context.rate_limit, Instant::now(), &service)
+}
+
+fn error_action(
+    error: &RobotLBError,
+    rate_limit: &RateLimitGate,
+    now: Instant,
+    service: &str,
+) -> Action {
     match error {
         RobotLBError::SkipService => Action::await_change(),
+        RobotLBError::RateLimited(wait) => Action::requeue(spread(*wait, service)),
+        error if error.is_rate_limited() => {
+            Action::requeue(spread(rate_limit.on_rate_limited(now), service))
+        }
         _ => Action::requeue(Duration::from_secs(30)),
     }
 }
@@ -537,9 +630,11 @@ fn on_error(_: Arc<Service>, error: &RobotLBError, _context: Arc<CurrentContext>
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_lb_services, consts, is_excluded_from_lb, is_lb_eligible_node,
-        is_local_traffic_policy, node_source, NodeSource,
+        balancer_for, collect_lb_services, consts, error_action, event_note, is_excluded_from_lb,
+        is_lb_eligible_node, is_local_traffic_policy, node_source, publishes_event, service_role,
+        CurrentContext, HCloudConfig, NodeSource, OperatorConfig, RobotLBError, ServiceRole,
     };
+    use clap::Parser;
     use k8s_openapi::{
         api::core::v1::{
             Node, NodeCondition, NodeSpec, NodeStatus, Service, ServicePort, ServiceSpec,
@@ -547,6 +642,31 @@ mod tests {
         apimachinery::pkg::apis::meta::v1::ObjectMeta,
     };
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn only_a_reconciliation_reads_the_annotations() {
+        let config = OperatorConfig::try_parse_from(["robotlb", "--hcloud-token", "t"]).unwrap();
+        let client =
+            kube::Client::try_from(kube::Config::new("http://127.0.0.1:1".parse().unwrap()))
+                .unwrap();
+        let context = CurrentContext::new(client, config, HCloudConfig::default());
+        let svc = Service {
+            metadata: ObjectMeta {
+                uid: Some("uid-1".to_string()),
+                annotations: Some(
+                    [(consts::LB_RETRIES_ANN_NAME.to_string(), "abc".to_string())].into(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(balancer_for(&ServiceRole::Release, &svc, &context).is_ok());
+        assert!(balancer_for(&ServiceRole::Reconcile, &svc, &context).is_err());
+        assert!(matches!(
+            balancer_for(&ServiceRole::Release, &Service::default(), &context),
+            Err(RobotLBError::SkipService)
+        ));
+    }
 
     fn service(spec: ServiceSpec) -> Service {
         Service {
@@ -733,5 +853,197 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(node_source(&svc, false), NodeSource::Annotation);
+    }
+
+    #[test]
+    fn an_event_note_is_redacted_and_bounded() {
+        let token = "0123456789abcdef";
+        let error = crate::error::RobotLBError::HCloudError(format!(
+            "rejected token {} {}",
+            &token[..10],
+            "é".repeat(600)
+        ));
+        let note = event_note(&error, token);
+        assert!(!note.contains(&token[..10]));
+        assert!(note.contains("[REDACTED]"));
+        assert!(note.len() <= 1024);
+    }
+
+    #[test]
+    fn a_gated_service_waits_out_the_pause() {
+        let gate = crate::rate_limit::RateLimitGate::default();
+        let wait = std::time::Duration::from_secs(42);
+        let error = crate::error::RobotLBError::RateLimited(wait);
+        assert_eq!(
+            error_action(&error, &gate, std::time::Instant::now(), "shop/web"),
+            kube::runtime::controller::Action::requeue(crate::rate_limit::spread(wait, "shop/web"))
+        );
+    }
+
+    #[test]
+    fn a_rate_limited_call_closes_the_gate() {
+        let gate = crate::rate_limit::RateLimitGate::default();
+        let now = std::time::Instant::now();
+        let error = crate::error::RobotLBError::from(hcloud::apis::Error::<
+            hcloud::apis::load_balancers_api::AddTargetError,
+        >::ResponseError(
+            hcloud::apis::ResponseContent {
+                status: 429_u16.try_into().unwrap(),
+                content: String::new(),
+                entity: None,
+            },
+        ));
+        assert_eq!(
+            error_action(&error, &gate, now, "shop/web"),
+            kube::runtime::controller::Action::requeue(crate::rate_limit::spread(
+                std::time::Duration::from_secs(60),
+                "shop/web"
+            ))
+        );
+        assert!(gate.remaining(now).is_some());
+    }
+
+    #[test]
+    fn other_errors_retry_in_30_seconds() {
+        let gate = crate::rate_limit::RateLimitGate::default();
+        let error = crate::error::RobotLBError::HCloudError("boom".to_string());
+        assert_eq!(
+            error_action(&error, &gate, std::time::Instant::now(), "shop/web"),
+            kube::runtime::controller::Action::requeue(std::time::Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn every_failure_except_a_skip_publishes_an_event() {
+        use crate::error::RobotLBError;
+        assert!(!publishes_event(&RobotLBError::SkipService));
+        // Jitter wakes the same service first after every pause, so the others only
+        // ever see the closed gate, and without an event of their own they go silent.
+        assert!(publishes_event(&RobotLBError::RateLimited(
+            std::time::Duration::from_secs(1)
+        )));
+        assert!(publishes_event(&RobotLBError::from(hcloud::apis::Error::<
+            hcloud::apis::load_balancers_api::ListLoadBalancersError,
+        >::ResponseError(
+            hcloud::apis::ResponseContent {
+                status: 429_u16.try_into().unwrap(),
+                content: String::new(),
+                entity: None,
+            }
+        ))));
+        assert!(publishes_event(&RobotLBError::HCloudError(
+            "boom".to_string()
+        )));
+        assert!(publishes_event(&RobotLBError::UnrecognisedBalancer {
+            name: "web".to_string(),
+            uid: "uid-1".to_string(),
+        }));
+        assert!(publishes_event(&RobotLBError::ForeignBalancer {
+            name: "web".to_string(),
+            owner: "uid-2".to_string(),
+        }));
+        assert!(publishes_event(&RobotLBError::NoNodesToRecogniseBalancer(
+            "web".to_string()
+        )));
+        assert!(publishes_event(&RobotLBError::AmbiguousBalancer(
+            "web".to_string()
+        )));
+    }
+
+    fn owned_service(type_: &str, class: Option<&str>, deleting: bool) -> Service {
+        Service {
+            metadata: ObjectMeta {
+                finalizers: Some(vec![consts::FINALIZER_NAME.to_string()]),
+                deletion_timestamp: deleting.then(|| {
+                    k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                        k8s_openapi::chrono::Utc::now(),
+                    )
+                }),
+                ..Default::default()
+            },
+            spec: Some(ServiceSpec {
+                type_: Some(type_.to_string()),
+                load_balancer_class: class.map(str::to_string),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_robotlb_load_balancer_is_reconciled() {
+        let svc = service(ServiceSpec {
+            type_: Some("LoadBalancer".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(service_role(&svc), ServiceRole::Reconcile);
+        let svc = owned_service("LoadBalancer", Some(consts::ROBOTLB_LB_CLASS), false);
+        assert_eq!(service_role(&svc), ServiceRole::Reconcile);
+    }
+
+    #[test]
+    fn services_robotlb_does_not_own_are_skipped() {
+        let other_class = service(ServiceSpec {
+            type_: Some("LoadBalancer".to_string()),
+            load_balancer_class: Some("example.com/other".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(service_role(&other_class), ServiceRole::Skip);
+        let cluster_ip = service(ServiceSpec {
+            type_: Some("ClusterIP".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(service_role(&cluster_ip), ServiceRole::Skip);
+        let mut deleting_cluster_ip = owned_service("ClusterIP", None, true);
+        deleting_cluster_ip.metadata.finalizers = None;
+        assert_eq!(service_role(&deleting_cluster_ip), ServiceRole::Skip);
+        let mut deleting_other_class =
+            owned_service("LoadBalancer", Some("example.com/other"), true);
+        deleting_other_class.metadata.finalizers = None;
+        assert_eq!(service_role(&deleting_other_class), ServiceRole::Skip);
+    }
+
+    // A type change and a change back with another class can both land before robotlb
+    // reconciles, for example while the rate limit gate is closed.
+    #[test]
+    fn an_owned_service_taken_over_by_another_class_is_released() {
+        let svc = owned_service("LoadBalancer", Some("example.com/other"), false);
+        assert_eq!(service_role(&svc), ServiceRole::Release);
+    }
+
+    // Reachable when the finalizer was removed by hand while another controller's
+    // finalizer still holds the object.
+    #[test]
+    fn a_deleted_robotlb_load_balancer_without_the_finalizer_is_released() {
+        let mut svc = owned_service("LoadBalancer", None, true);
+        svc.metadata.finalizers = None;
+        assert_eq!(service_role(&svc), ServiceRole::Release);
+    }
+
+    #[test]
+    fn an_owned_service_that_stopped_being_a_load_balancer_is_released() {
+        assert_eq!(
+            service_role(&owned_service("ClusterIP", None, false)),
+            ServiceRole::Release
+        );
+    }
+
+    #[test]
+    fn a_deleted_owned_service_is_released() {
+        assert_eq!(
+            service_role(&owned_service("LoadBalancer", None, true)),
+            ServiceRole::Release
+        );
+        assert_eq!(
+            service_role(&owned_service("ClusterIP", None, true)),
+            ServiceRole::Release
+        );
+    }
+
+    #[test]
+    fn a_service_without_exposable_ports_reports_an_event() {
+        let error = crate::error::RobotLBError::NoExposablePorts;
+        assert!(publishes_event(&error));
+        assert!(error.to_string().starts_with("No TCP port"));
     }
 }
