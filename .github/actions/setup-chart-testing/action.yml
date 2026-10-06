@@ -1,0 +1,72 @@
+name: Set up chart-testing
+description: >-
+  Install helm chart-testing (ct) plus yamllint and yamale, reproducing
+  helm/chart-testing-action but wrapping the cosign-verified download in a retry
+  so a transient sigstore/Rekor HTTP/2 stream reset does not fail the job.
+  Requires actions/setup-python to have run first (yamllint/yamale go into a
+  dedicated venv built from that Python).
+runs:
+  using: composite
+  steps:
+    - name: Install cosign
+      uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+    # The upstream helm/chart-testing-action runs a bare `cosign verify-blob`
+    # whose Rekor transparency-log query is the one un-retried network call; a
+    # transient HTTP/2 stream reset there fails the whole Lint Chart job. Wrap
+    # the download + verify + install in a retry so the blip is recoverable.
+    - name: Download, verify and install chart-testing
+      uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
+      with:
+        shell: bash
+        timeout_minutes: 5
+        max_attempts: 3
+        retry_wait_seconds: 10
+        command: |
+          set -euo pipefail
+
+          CT_VERSION="v3.14.0"
+          YAMLLINT_VERSION="1.38.0"
+          YAMALE_VERSION="6.1.0"
+
+          if [[ "$(uname -m)" == "aarch64" ]]; then arch=arm64; else arch=amd64; fi
+          ver="${CT_VERSION#v}"
+          dir="${RUNNER_TEMP}/ct"
+          base="https://github.com/helm/chart-testing/releases/download/${CT_VERSION}"
+          tarball="chart-testing_${ver}_linux_${arch}.tar.gz"
+          mkdir -p "${dir}"
+
+          curl --retry 5 --retry-delay 1 -sSLo "${dir}/ct.tar.gz"     "${base}/${tarball}"
+          curl --retry 5 --retry-delay 1 -sSLo "${dir}/ct.tar.gz.pem" "${base}/${tarball}.pem"
+          curl --retry 5 --retry-delay 1 -sSLo "${dir}/ct.tar.gz.sig" "${base}/${tarball}.sig"
+
+          # Keyless verification against the chart-testing release workflow's
+          # identity. The identity/issuer are stable across ct versions (they
+          # reference the workflow ref, not the version), so only CT_VERSION
+          # changes on a bump.
+          cosign verify-blob \
+            --certificate "${dir}/ct.tar.gz.pem" \
+            --signature "${dir}/ct.tar.gz.sig" \
+            --certificate-identity "https://github.com/helm/chart-testing/.github/workflows/release.yaml@refs/heads/main" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${dir}/ct.tar.gz"
+
+          tar -xzf "${dir}/ct.tar.gz" -C "${dir}"
+          rm -f "${dir}/ct.tar.gz" "${dir}/ct.tar.gz.pem" "${dir}/ct.tar.gz.sig"
+
+          # Install yamllint + yamale into a dedicated venv and put its bin dir
+          # on PATH explicitly, mirroring upstream ct.sh. ct lint shells out to
+          # both tools by name, so relying on the ambient pip console-script dir
+          # being on PATH would be fragile — the venv makes resolution explicit.
+          python3 -m venv "${dir}/venv"
+          "${dir}/venv/bin/pip" install "yamllint==${YAMLLINT_VERSION}" "yamale==${YAMALE_VERSION}"
+
+          # $GITHUB_PATH / $GITHUB_ENV are job-scoped files, so these appends
+          # persist to subsequent job steps even though they run inside the
+          # retry wrapper. CT_CONFIG_DIR points at the tarball's etc/ dir
+          # (chart_schema.yaml + lintconf.yaml), matching upstream ct.sh.
+          echo "${dir}" >> "${GITHUB_PATH}"
+          echo "${dir}/venv/bin" >> "${GITHUB_PATH}"
+          echo "CT_CONFIG_DIR=${dir}/etc" >> "${GITHUB_ENV}"
+
+          "${dir}/ct" version

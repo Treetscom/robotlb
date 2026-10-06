@@ -570,10 +570,11 @@ pub async fn reconcile_load_balancer(
     svc: Arc<Service>,
     context: Arc<CurrentContext>,
 ) -> RobotLBResult<Action> {
-    let mut node_ip_type = "InternalIP";
-    if lb.network_name.is_none() {
-        node_ip_type = "ExternalIP";
-    }
+    let node_ip_type = if lb.network_name.is_none() {
+        "ExternalIP"
+    } else {
+        "InternalIP"
+    };
 
     let nodes = match node_source(&svc, context.config.dynamic_node_selector) {
         NodeSource::Annotation => get_nodes_by_selector(&svc, &context).await?,
@@ -637,7 +638,7 @@ pub async fn reconcile_load_balancer(
             "ip": ipv4,
             "dns": dns_ipv4,
             "ip_mode": "VIP"
-        }))
+        }));
     }
     if context.config.ipv6_ingress {
         if let Some(ipv6) = &ipv6 {
@@ -645,7 +646,7 @@ pub async fn reconcile_load_balancer(
                 "ip": ipv6,
                 "dns": dns_ipv6,
                 "ip_mode": "VIP"
-            }))
+            }));
         }
     }
 

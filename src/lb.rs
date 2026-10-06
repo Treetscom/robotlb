@@ -729,15 +729,13 @@ impl LoadBalancer {
                 network_name
             );
             return Err(RobotLBError::HCloudError(format!(
-                "Found more than one network with name {}",
-                network_name,
+                "Found more than one network with name {network_name}",
             )));
         }
         if networks.is_empty() {
             tracing::warn!("Network with name {} not found", network_name);
             return Err(RobotLBError::HCloudError(format!(
-                "Network with name {} not found",
-                network_name,
+                "Network with name {network_name} not found",
             )));
         }
 
