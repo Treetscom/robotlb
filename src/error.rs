@@ -22,6 +22,10 @@ pub enum RobotLBError {
     UnknownLBAlgorithm,
     #[error("Cannot get target nodes, because the service has no selector")]
     ServiceWithoutSelector,
+    #[error(
+        "No TCP port of the service has a nodePort, so the load balancer has nothing to forward"
+    )]
+    NoExposablePorts,
     #[error("Hetzner Cloud API rate limit reached, the pause ends in {}s", .0.as_millis().div_ceil(1000))]
     RateLimited(std::time::Duration),
 
@@ -116,6 +120,7 @@ impl RobotLBError {
             | Self::KubeError(_)
             | Self::UnknownLBAlgorithm
             | Self::ServiceWithoutSelector
+            | Self::NoExposablePorts
             | Self::RateLimited(_) => false,
         }
     }

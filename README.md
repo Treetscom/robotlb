@@ -46,9 +46,17 @@ Setting `ROBOTLB_DYNAMIC_NODE_SELECTOR` to `false` replaces both with the node s
 
 A balancer type caps how many targets it holds: `lb11`, the default type, holds 25. When more nodes are selected than the type holds, the extra ones are dropped in a stable order and a warning names the limit. Pick a bigger type through `ROBOTLB_DEFAULT_LB_TYPE` or the `robotlb/balancer-type` annotation to use the whole cluster.
 
-Every port of the service needs an allocated `nodePort`. A Hetzner load balancer forwards traffic to the IP of a node, so a port is reachable only through its `nodePort`: ports without one are skipped, and `allocateLoadBalancerNodePorts: false` is not supported. When no port of a service can be exposed, no balancer is created for it, and a service that already advertises an external IP loses it.
+robotlb deletes the balancer when the service is deleted or stops being a `LoadBalancer`, and finds it by the name the service has at that moment. When the `robotlb/balancer` annotation was changed or removed before that, the balancer under the old name stays in the project, and the balancer under the current name is deleted, even when another service uses it. Services that share a balancer name share one balancer: releasing either of them deletes it. Without the `robotlb/balancer` annotation the name is the service name without its namespace.
+
+Every port of the service needs an allocated `nodePort`. A Hetzner load balancer forwards traffic to the IP of a node, so a port is reachable only through its `nodePort`: ports without one are skipped, and `allocateLoadBalancerNodePorts: false` is not supported. When no port of a service can be exposed, no balancer is created for it, an existing balancer and the service's external IP are kept as they are, and a warning event on the service reports the problem.
 
 > Earlier releases treated every service as if it had the `Local` policy. Services that leave `externalTrafficPolicy` unset therefore get the full node list on upgrade, which changes the targets of their existing balancers.
+
+> Earlier releases kept the balancer of a service whose type was changed from `LoadBalancer`, or that moved to another load balancer class. Such a service still carries the `robotlb/finalizer` finalizer, and its Hetzner balancer is deleted on the first start after the upgrade. Its balancer is found by name. Without the `robotlb/balancer` annotation the name is the service name without its namespace, so a `LoadBalancer` service with the same name in another namespace may be using that balancer. List the affected services before upgrading and check their balancers:
+>
+> ```bash
+> kubectl get services --all-namespaces --output json | jq --raw-output '.items[] | select(((.metadata.finalizers // []) | index("robotlb/finalizer")) and (.spec.type != "LoadBalancer" or (.spec.loadBalancerClass // "robotlb") != "robotlb")) | "\(.metadata.namespace)/\(.metadata.name)"'
+> ```
 
 
 ## Configuration
