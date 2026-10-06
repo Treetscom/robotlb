@@ -26,6 +26,10 @@ use crate::{
     CurrentContext,
 };
 
+/// Retries after the first attempt, sleeping 1 unit, 2 units, ... between them.
+const BUSY_RETRIES: u32 = 2;
+const BUSY_RETRY_UNIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 #[derive(Debug)]
 pub struct LBService {
     pub listen_port: i32,
@@ -219,46 +223,38 @@ impl LoadBalancer {
             // Here we check that all the services are configured correctly.
             // If the service is not configured correctly, we update it.
             if let Some(destination_port) = self.services.get(&service.listen_port) {
-                if service.destination_port == *destination_port
-                    && service.health_check.port == *destination_port
-                    && service.health_check.interval == self.check_interval
-                    && service.health_check.retries == self.retries
-                    && service.health_check.timeout == self.timeout
-                    && service.proxyprotocol == self.proxy_mode
-                    && service.http.is_none()
-                    && service.health_check.protocol
-                        == hcloud::models::load_balancer_service_health_check::Protocol::Tcp
-                {
-                    // The desired configuration matches the current configuration.
+                if self.service_is_current(service, *destination_port) {
                     continue;
                 }
                 tracing::info!(
                     "Desired service configuration for port {} does not match current configuration. Updating ...",
                     service.listen_port,
                 );
-                hcloud::apis::load_balancers_api::update_service(
+                retry_temporary(BUSY_RETRIES, BUSY_RETRY_UNIT, || {
+                    hcloud::apis::load_balancers_api::update_service(
                         &self.hcloud_config,
-                    UpdateServiceParams {
-                        id: hcloud_balancer.id,
-                        body: Some(UpdateLoadBalancerService {
-                            http: None,
-                            protocol: Some(hcloud::models::update_load_balancer_service::Protocol::Tcp),
-                            listen_port: service.listen_port,
-                            destination_port: Some(*destination_port),
-                            proxyprotocol: Some(self.proxy_mode),
-                            health_check: Some(Box::new(
-                                hcloud::models::UpdateLoadBalancerServiceHealthCheck {
-                                    protocol: Some(hcloud::models::update_load_balancer_service_health_check::Protocol::Tcp),
-                                    http: None,
-                                    interval: Some(self.check_interval),
-                                    port: Some(*destination_port),
-                                    retries: Some(self.retries),
-                                    timeout: Some(self.timeout),
-                                },
-                            )),
-                        }),
-                    },
-                )
+                        UpdateServiceParams {
+                            id: hcloud_balancer.id,
+                            body: Some(UpdateLoadBalancerService {
+                                http: None,
+                                protocol: Some(hcloud::models::update_load_balancer_service::Protocol::Tcp),
+                                listen_port: service.listen_port,
+                                destination_port: Some(*destination_port),
+                                proxyprotocol: Some(self.proxy_mode),
+                                health_check: Some(Box::new(
+                                    hcloud::models::UpdateLoadBalancerServiceHealthCheck {
+                                        protocol: Some(hcloud::models::update_load_balancer_service_health_check::Protocol::Tcp),
+                                        http: None,
+                                        interval: Some(self.check_interval),
+                                        port: Some(*destination_port),
+                                        retries: Some(self.retries),
+                                        timeout: Some(self.timeout),
+                                    },
+                                )),
+                            }),
+                        },
+                    )
+                })
                 .await?;
             } else {
                 tracing::info!(
@@ -266,15 +262,17 @@ impl LoadBalancer {
                     service.listen_port,
                     hcloud_balancer.name,
                 );
-                hcloud::apis::load_balancers_api::delete_service(
-                    &self.hcloud_config,
-                    DeleteServiceParams {
-                        id: hcloud_balancer.id,
-                        delete_service_request: Some(DeleteServiceRequest {
-                            listen_port: service.listen_port,
-                        }),
-                    },
-                )
+                retry_temporary(BUSY_RETRIES, BUSY_RETRY_UNIT, || {
+                    hcloud::apis::load_balancers_api::delete_service(
+                        &self.hcloud_config,
+                        DeleteServiceParams {
+                            id: hcloud_balancer.id,
+                            delete_service_request: Some(DeleteServiceRequest {
+                                listen_port: service.listen_port,
+                            }),
+                        },
+                    )
+                })
                 .await?;
             }
         }
@@ -289,32 +287,46 @@ impl LoadBalancer {
                     "Found missing service. Adding service that listens for port {}",
                     listen_port
                 );
-                hcloud::apis::load_balancers_api::add_service(
-                    &self.hcloud_config,
-                AddServiceParams {
-                    id: hcloud_balancer.id,
-                    body: Some(LoadBalancerService {
-                        http: None,
-                        listen_port: *listen_port,
-                        destination_port: *destination_port,
-                        protocol: hcloud::models::load_balancer_service::Protocol::Tcp,
-                        proxyprotocol: self.proxy_mode,
-                        health_check: Box::new(LoadBalancerServiceHealthCheck {
-                            http: None,
-                            interval: self.check_interval,
-                            port: *destination_port,
-                            protocol:
-                                hcloud::models::load_balancer_service_health_check::Protocol::Tcp,
-                            retries: self.retries,
-                            timeout: self.timeout,
-                        }),
-                    }),
-                },
-            )
-            .await?;
+                retry_temporary(BUSY_RETRIES, BUSY_RETRY_UNIT, || {
+                    hcloud::apis::load_balancers_api::add_service(
+                        &self.hcloud_config,
+                        AddServiceParams {
+                            id: hcloud_balancer.id,
+                            body: Some(LoadBalancerService {
+                                http: None,
+                                listen_port: *listen_port,
+                                destination_port: *destination_port,
+                                protocol: hcloud::models::load_balancer_service::Protocol::Tcp,
+                                proxyprotocol: self.proxy_mode,
+                                health_check: Box::new(LoadBalancerServiceHealthCheck {
+                                    http: None,
+                                    interval: self.check_interval,
+                                    port: *destination_port,
+                                    protocol:
+                                        hcloud::models::load_balancer_service_health_check::Protocol::Tcp,
+                                    retries: self.retries,
+                                    timeout: self.timeout,
+                                }),
+                            }),
+                        },
+                    )
+                })
+                .await?;
             }
         }
         Ok(())
+    }
+
+    fn service_is_current(&self, service: &LoadBalancerService, destination_port: i32) -> bool {
+        service.destination_port == destination_port
+            && service.health_check.port == destination_port
+            && service.health_check.interval == self.check_interval
+            && service.health_check.retries == self.retries
+            && service.health_check.timeout == self.timeout
+            && service.proxyprotocol == self.proxy_mode
+            && service.http.is_none()
+            && service.health_check.protocol
+                == hcloud::models::load_balancer_service_health_check::Protocol::Tcp
     }
 
     /// Reconcile the targets of the load balancer.
@@ -348,22 +360,25 @@ impl LoadBalancer {
             };
             if !planned.contains(&target_ip.ip.as_str()) {
                 tracing::info!("Removing target {}", target_ip.ip);
-                hcloud::apis::load_balancers_api::remove_target(
-                    &self.hcloud_config,
-                    RemoveTargetParams {
-                        id: hcloud_balancer.id,
-                        remove_target_request: Some(RemoveTargetRequest {
-                            ip: Some(target_ip),
-                            ..Default::default()
-                        }),
-                    },
-                )
+                retry_temporary(BUSY_RETRIES, BUSY_RETRY_UNIT, || {
+                    hcloud::apis::load_balancers_api::remove_target(
+                        &self.hcloud_config,
+                        RemoveTargetParams {
+                            id: hcloud_balancer.id,
+                            remove_target_request: Some(RemoveTargetRequest {
+                                ip: Some(target_ip.clone()),
+                                ..Default::default()
+                            }),
+                        },
+                    )
+                })
                 .await?;
             }
         }
 
         let mut live = 0_usize;
         let mut last_error = None;
+        let mut retries = BUSY_RETRIES;
         for ip in &planned {
             if hcloud_balancer
                 .targets
@@ -374,23 +389,35 @@ impl LoadBalancer {
                 continue;
             }
             tracing::info!("Adding target {}", ip);
-            let added = hcloud::apis::load_balancers_api::add_target(
-                &self.hcloud_config,
-                AddTargetParams {
-                    id: hcloud_balancer.id,
-                    body: Some(LoadBalancerAddTarget {
-                        ip: Some(Box::new(hcloud::models::LoadBalancerTargetIp {
-                            ip: (*ip).to_string(),
-                        })),
-                        ..Default::default()
-                    }),
-                },
-            )
+            let added = retry_temporary(retries, BUSY_RETRY_UNIT, || {
+                hcloud::apis::load_balancers_api::add_target(
+                    &self.hcloud_config,
+                    AddTargetParams {
+                        id: hcloud_balancer.id,
+                        body: Some(LoadBalancerAddTarget {
+                            ip: Some(Box::new(hcloud::models::LoadBalancerTargetIp {
+                                ip: (*ip).to_string(),
+                            })),
+                            ..Default::default()
+                        }),
+                    },
+                )
+            })
             .await;
+            // A lock is on the whole balancer and a failing API stays failing for a while,
+            // so once the retries ran out for one target the remaining ones would only
+            // wait the same time for nothing.
+            if added
+                .as_ref()
+                .is_err_and(crate::error::is_temporary_rejection)
+            {
+                retries = 0;
+            }
             // Hetzner rejects IPs outside the vSwitch subnet of the attached network,
             // which must not keep the remaining nodes out of the load balancer.
             match added {
                 Ok(_) => live += 1,
+                Err(error) if crate::error::is_target_already_defined(&error) => live += 1,
                 // Every further call would be rejected too and only drain the budget.
                 Err(error) if crate::error::is_rate_limit_response(&error) => {
                     return Err(error.into());
@@ -421,7 +448,7 @@ impl LoadBalancer {
         &self,
         hcloud_balancer: &hcloud::models::LoadBalancer,
     ) -> RobotLBResult<()> {
-        if *hcloud_balancer.algorithm == self.algorithm.clone().into() {
+        if *hcloud_balancer.algorithm == self.algorithm.clone() {
             return Ok(());
         }
         tracing::info!(
@@ -429,13 +456,15 @@ impl LoadBalancer {
             hcloud_balancer.algorithm,
             self.algorithm
         );
-        hcloud::apis::load_balancers_api::change_algorithm(
-            &self.hcloud_config,
-            ChangeAlgorithmParams {
-                id: hcloud_balancer.id,
-                body: Some(self.algorithm.clone().into()),
-            },
-        )
+        retry_temporary(BUSY_RETRIES, BUSY_RETRY_UNIT, || {
+            hcloud::apis::load_balancers_api::change_algorithm(
+                &self.hcloud_config,
+                ChangeAlgorithmParams {
+                    id: hcloud_balancer.id,
+                    body: Some(self.algorithm.clone()),
+                },
+            )
+        })
         .await?;
         Ok(())
     }
@@ -453,15 +482,17 @@ impl LoadBalancer {
             hcloud_balancer.load_balancer_type.name,
             self.balancer_type
         );
-        hcloud::apis::load_balancers_api::change_type_of_load_balancer(
-            &self.hcloud_config,
-            ChangeTypeOfLoadBalancerParams {
-                id: hcloud_balancer.id,
-                change_type_of_load_balancer_request: Some(ChangeTypeOfLoadBalancerRequest {
-                    load_balancer_type: self.balancer_type.clone(),
-                }),
-            },
-        )
+        retry_temporary(BUSY_RETRIES, BUSY_RETRY_UNIT, || {
+            hcloud::apis::load_balancers_api::change_type_of_load_balancer(
+                &self.hcloud_config,
+                ChangeTypeOfLoadBalancerParams {
+                    id: hcloud_balancer.id,
+                    change_type_of_load_balancer_request: Some(ChangeTypeOfLoadBalancerRequest {
+                        load_balancer_type: self.balancer_type.clone(),
+                    }),
+                },
+            )
+        })
         .await?;
         Ok(())
     }
@@ -506,17 +537,19 @@ impl LoadBalancer {
                     }
                 }
                 tracing::info!("Detaching balancer from network {}", private_net_id);
-                hcloud::apis::load_balancers_api::detach_load_balancer_from_network(
-                    &self.hcloud_config,
-                    DetachLoadBalancerFromNetworkParams {
-                        id: hcloud_balancer.id,
-                        detach_load_balancer_from_network_request: Some(
-                            DetachLoadBalancerFromNetworkRequest {
-                                network: private_net_id,
-                            },
-                        ),
-                    },
-                )
+                retry_temporary(BUSY_RETRIES, BUSY_RETRY_UNIT, || {
+                    hcloud::apis::load_balancers_api::detach_load_balancer_from_network(
+                        &self.hcloud_config,
+                        DetachLoadBalancerFromNetworkParams {
+                            id: hcloud_balancer.id,
+                            detach_load_balancer_from_network_request: Some(
+                                DetachLoadBalancerFromNetworkRequest {
+                                    network: private_net_id,
+                                },
+                            ),
+                        },
+                    )
+                })
                 .await?;
             }
         }
@@ -525,18 +558,20 @@ impl LoadBalancer {
                 return Ok(());
             };
             tracing::info!("Attaching balancer to network {}", network_id);
-            hcloud::apis::load_balancers_api::attach_load_balancer_to_network(
-                &self.hcloud_config,
-                AttachLoadBalancerToNetworkParams {
-                    id: hcloud_balancer.id,
-                    attach_load_balancer_to_network_request: Some(
-                        AttachLoadBalancerToNetworkRequest {
-                            ip: self.private_ip.clone(),
-                            network: network_id,
-                        },
-                    ),
-                },
-            )
+            retry_temporary(BUSY_RETRIES, BUSY_RETRY_UNIT, || {
+                hcloud::apis::load_balancers_api::attach_load_balancer_to_network(
+                    &self.hcloud_config,
+                    AttachLoadBalancerToNetworkParams {
+                        id: hcloud_balancer.id,
+                        attach_load_balancer_to_network_request: Some(
+                            AttachLoadBalancerToNetworkRequest {
+                                ip: self.private_ip.clone(),
+                                network: network_id,
+                            },
+                        ),
+                    },
+                )
+            })
             .await?;
         }
         Ok(())
@@ -886,6 +921,33 @@ impl From<LBAlgorithm> for LoadBalancerAlgorithm {
     }
 }
 
+/// Call `call`, and call it again after `unit`, `2 * unit`, ... while Hetzner rejects it
+/// for a temporary reason, up to `retries` more times. Returns the last outcome.
+async fn retry_temporary<T, E, F, Fut>(
+    retries: u32,
+    unit: std::time::Duration,
+    mut call: F,
+) -> Result<T, hcloud::apis::Error<E>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, hcloud::apis::Error<E>>>,
+{
+    let mut attempt = 0_u32;
+    loop {
+        match call().await {
+            Err(error) if attempt < retries && crate::error::is_temporary_rejection(&error) => {
+                attempt += 1;
+                tracing::debug!(
+                    "Rejected temporarily, retry {attempt}: {}",
+                    crate::error::describe(&error)
+                );
+                tokio::time::sleep(unit * attempt).await;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -912,6 +974,81 @@ mod tests {
             plan_targets(&desired, 25),
             vec!["192.168.100.2", "192.168.100.4"]
         );
+    }
+
+    use super::retry_temporary;
+    use hcloud::apis::{load_balancers_api::AddTargetError, Error, ResponseContent};
+    use std::{
+        sync::atomic::{AtomicU32, Ordering},
+        time::Duration,
+    };
+
+    fn rejected(status: u16) -> Error<AddTargetError> {
+        Error::ResponseError(ResponseContent {
+            status: status.try_into().unwrap(),
+            content: if status == 423 {
+                r#"{"error": {"code": "locked", "message": "item is locked"}}"#.to_string()
+            } else {
+                String::new()
+            },
+            entity: None,
+        })
+    }
+
+    /// Answers with `statuses` in order, then with success; returns the outcome and the call count.
+    async fn run(retries: u32, statuses: &[u16]) -> (Result<(), Error<AddTargetError>>, u32) {
+        let calls = AtomicU32::new(0);
+        let result = retry_temporary(retries, Duration::ZERO, || {
+            let call = calls.fetch_add(1, Ordering::Relaxed);
+            let answer = statuses
+                .get(call as usize)
+                .map_or(Ok(()), |s| Err(rejected(*s)));
+            async move { answer }
+        })
+        .await;
+        (result, calls.load(Ordering::Relaxed))
+    }
+
+    #[tokio::test]
+    async fn a_locked_balancer_is_retried_until_it_accepts() {
+        let (result, calls) = run(2, &[423, 423]).await;
+        assert!(result.is_ok());
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test]
+    async fn a_balancer_that_stays_locked_gets_the_first_call_and_the_retries_only() {
+        let (result, calls) = run(2, &[423; 10]).await;
+        assert!(result.is_err());
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test]
+    async fn no_retries_means_a_single_call() {
+        let (result, calls) = run(0, &[423; 10]).await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn a_permanent_rejection_is_not_retried() {
+        let (result, calls) = run(2, &[422; 10]).await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_is_not_retried() {
+        let (result, calls) = run(2, &[429; 10]).await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn a_success_is_not_repeated() {
+        let (result, calls) = run(2, &[]).await;
+        assert!(result.is_ok());
+        assert_eq!(calls, 1);
     }
 
     #[test]
