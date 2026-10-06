@@ -53,6 +53,7 @@ pub mod error;
 pub mod finalizers;
 pub mod label_filter;
 pub mod lb;
+pub mod memo;
 pub mod rate_limit;
 pub mod triggers;
 
@@ -222,6 +223,7 @@ fn cluster_changes(
 #[derive(Clone)]
 pub struct CurrentContext {
     pub client: kube::Client,
+    pub memo: Arc<memo::ReconcileMemo>,
     pub config: OperatorConfig,
     pub hcloud_config: HCloudConfig,
     pub rate_limit: Arc<RateLimitGate>,
@@ -231,6 +233,7 @@ impl CurrentContext {
     pub fn new(client: kube::Client, config: OperatorConfig, hcloud_config: HCloudConfig) -> Self {
         Self {
             client,
+            memo: Arc::default(),
             config,
             hcloud_config,
             rate_limit: Arc::default(),
@@ -253,6 +256,7 @@ pub async fn reconcile_service(
             report_failure(&svc, &context, error).await;
         }
     }
+    context.memo.settle(&svc, result.is_ok());
     result
 }
 
@@ -568,9 +572,23 @@ pub async fn reconcile_load_balancer(
     if lb.services.is_empty() {
         tracing::warn!("Service has no port that can be exposed. Skipping the load balancer.");
         clear_ingress_status(&svc_api, &svc).await?;
+        // The cleared status must come back once the ports are restored.
+        if let Some(uid) = svc.uid() {
+            context.memo.forget(&uid);
+        }
         return Ok(Action::requeue(Duration::from_secs(
             context.config.resync_interval,
         )));
+    }
+
+    let uid = svc.uid();
+    let fingerprint = memo::fingerprint(&svc, &lb.targets, &lb.services);
+    if let Some(wait) = uid
+        .as_deref()
+        .and_then(|uid| context.memo.unchanged(uid, fingerprint, Instant::now()))
+    {
+        tracing::debug!("Nothing robotlb acts on changed since the last reconcile. Skipping...");
+        return Ok(Action::requeue(wait));
     }
 
     let (hcloud_lb, targets_missing) = lb.reconcile().await?;
@@ -614,10 +632,13 @@ pub async fn reconcile_load_balancer(
             .await?;
     }
 
-    Ok(Action::requeue(success_requeue(
-        targets_missing,
-        context.config.resync_interval,
-    )))
+    let requeue = success_requeue(targets_missing, context.config.resync_interval);
+    if let Some(uid) = &uid {
+        context
+            .memo
+            .record(uid, fingerprint, Instant::now(), requeue);
+    }
+    Ok(Action::requeue(requeue))
 }
 
 /// A target Hetzner rejected, for a reason other than the rate limit, may be accepted
