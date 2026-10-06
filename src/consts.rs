@@ -1,6 +1,5 @@
 pub const LB_NAME_LABEL_NAME: &str = "robotlb/balancer";
 pub const LB_NODE_SELECTOR: &str = "robotlb/node-selector";
-pub const LB_NODE_IP_LABEL_NAME: &str = "robotlb/node-ip";
 
 // LB config
 pub const LB_CHECK_INTERVAL_ANN_NAME: &str = "robotlb/lb-check-interval";
