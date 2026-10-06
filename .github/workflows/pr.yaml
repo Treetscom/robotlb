@@ -1,0 +1,425 @@
+name: PR Checks and Build
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: '1.98.0'
+  CI_IMAGE: ttl.sh/treetscom-robotlb
+  CHART_DIR: helm
+  CHART_NAME: robotlb
+
+jobs:
+  # pr-privileged.yaml reads this to know which PR the run belongs to.
+  save-pr-metadata:
+    name: Save PR Metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Save PR number
+        run: echo "${{ github.event.pull_request.number }}" > pr-number.txt
+
+      - name: Upload PR metadata
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-metadata
+          path: pr-number.txt
+          retention-days: 1
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Run Trivy vulnerability scanner (filesystem)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+
+      # A pull_request token cannot write security events; pr-privileged.yaml
+      # uploads this file from the base repository's context.
+      - name: Upload Trivy SARIF as artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: trivy-sarif
+          path: trivy-fs-results.sarif
+          retention-days: 1
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- --deny warnings
+
+      - name: markdownlint
+        uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff # v24
+        with:
+          globs: '**/*.md'
+
+  # actionlint also runs shellcheck on inline `run:` blocks. shellcheck comes
+  # from a digest-pinned image into /usr/local/bin, ahead of the runner's
+  # /usr/bin, so actionlint picks up the pinned one.
+  lint-workflows:
+    name: Lint Workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Install shellcheck and actionlint
+        run: |
+          set -euo pipefail
+
+          ACTIONLINT_VERSION="v1.7.12"
+          # actionlint is Go, so the checksum database attests it.
+          go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+          # The shellcheck releases carry no checksum or signature file, so
+          # the binary comes out of the upstream image, pinned by digest.
+          SHELLCHECK_IMAGE="koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d"
+          docker create --name shellcheck-tmp "${SHELLCHECK_IMAGE}"
+          sudo docker cp shellcheck-tmp:/bin/shellcheck /usr/local/bin/shellcheck
+          docker rm shellcheck-tmp
+
+          shellcheck --version
+          "$(go env GOPATH)/bin/actionlint" --version
+
+      - name: Run shellcheck (hack scripts)
+        run: shellcheck hack/*.sh
+
+      - name: Run actionlint (workflows)
+        run: actionlint -color
+
+      - name: Every workflow job carries a timeout
+        run: |
+          set -euo pipefail
+          missing=0
+          for f in .github/workflows/*.y*ml; do
+            jobs="$(yq '.jobs | to_entries[] | select(.value.uses == null and .value["timeout-minutes"] == null) | .key' "${f}")"
+            for job in ${jobs}; do
+              echo "::error file=${f}::job '${job}' has no timeout-minutes"
+              missing=1
+            done
+          done
+          exit "${missing}"
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Run tests
+        run: cargo test --all --locked
+
+  lint-chart:
+    name: Lint Chart
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: 'v4.3.0'
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.14.7'
+
+      - name: Set up chart-testing
+        uses: ./.github/actions/setup-chart-testing
+
+      - name: Run Helm Lint
+        run: helm lint "${CHART_DIR}"
+
+      # The release workflow sets the chart version from the release tag, so
+      # a chart change carries no version bump of its own. The chart lists no
+      # maintainers.
+      - name: Run chart-testing (lint)
+        run: |
+          ct lint --charts "${CHART_DIR}" \
+            --check-version-increment=false \
+            --validate-maintainers=false
+
+      - name: Template Chart with defaults
+        run: helm template test-release "${CHART_DIR}"
+
+  build-and-push:
+    name: Build and Push (${{ matrix.arch }})
+    needs: [security, lint, lint-workflows, test]
+    runs-on: ${{ matrix.runner }}
+    # ttl.sh sometimes stalls a push for tens of minutes; without a bound a
+    # stalled leg holds the runner for the six-hour default.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      # ttl.sh intermittently drops blob writes after a clean build. The retry
+      # runs only when the first attempt failed, and the gha layer cache keeps
+      # it cheap.
+      - name: Build and Push to ttl.sh by digest
+        id: build
+        continue-on-error: true
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.CI_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+          cache-to: type=gha,scope=build-${{ matrix.arch }},mode=max
+
+      - name: Build and Push to ttl.sh by digest (retry)
+        id: build-retry
+        if: steps.build.outcome == 'failure'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.CI_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+          cache-to: type=gha,scope=build-${{ matrix.arch }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          if [[ "${{ steps.build.outcome }}" == "success" ]]; then
+            digest="${{ steps.build.outputs.digest }}"
+          else
+            digest="${{ steps.build-retry.outputs.digest }}"
+          fi
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-manifests:
+    name: Merge Manifests
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          sparse-checkout: hack
+
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: digests-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          TAG="pr-${PR_NUMBER}-1d"
+          # pr-N-1d is a human alias that later runs overwrite. The run-scoped
+          # tag is narrower, but ttl.sh is unauthenticated and the run id is
+          # public, so what it resolves to is checked in the next step.
+          RUN_TAG="pr-${PR_NUMBER}-run-${{ github.run_id }}"
+
+          images=()
+          for digest_file in *; do
+            [[ -f "$digest_file" ]] || continue
+            images+=("${CI_IMAGE}@sha256:${digest_file}")
+          done
+
+          ok=0
+          for attempt in 1 2 3; do
+            if docker buildx imagetools create \
+              --tag "${CI_IMAGE}:${TAG}" \
+              --tag "${CI_IMAGE}:${RUN_TAG}" \
+              "${images[@]}"; then
+              ok=1
+              break
+            fi
+            if [[ "${attempt}" -lt 3 ]]; then
+              echo "imagetools create failed (attempt ${attempt}); retrying in 5s..."
+              sleep 5
+            fi
+          done
+          [[ "${ok}" -eq 1 ]]
+
+      # Anyone can overwrite a ttl.sh tag, so the manifest list is published by
+      # digest, after checking it lists exactly the manifests this run pushed.
+      - name: Export image reference
+        run: |
+          set -euo pipefail
+
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          mkdir -p /tmp/refs
+          digest="$(docker buildx imagetools inspect \
+            "${CI_IMAGE}:pr-${PR_NUMBER}-run-${{ github.run_id }}" \
+            --format '{{.Manifest.Digest}}')"
+          ref="${CI_IMAGE}@${digest}"
+
+          docker buildx imagetools inspect "${ref}" --raw > /tmp/index.json
+          hack/verify-manifest-children.sh "${CI_IMAGE}" /tmp/index.json /tmp/digests
+
+          echo "${ref}" > /tmp/refs/robotlb.ref
+          docker buildx imagetools inspect "${ref}"
+
+      - name: Upload image reference
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: image-ref
+          path: /tmp/refs/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Generate build summary
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          IMAGE_REF="$(cat /tmp/refs/robotlb.ref)"
+
+          {
+            echo "## Multi-arch Container Image"
+            echo ""
+            echo "- \`${IMAGE_REF}\`"
+            echo "- \`${CI_IMAGE}:pr-${PR_NUMBER}-1d\` (mutable: anyone can overwrite a ttl.sh tag)"
+            echo ""
+            echo "Platforms: linux/amd64, linux/arm64"
+            echo ""
+            echo '```bash'
+            echo "podman pull ${IMAGE_REF}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-chart:
+    name: Build Chart
+    runs-on: ubuntu-latest
+    needs: [security, lint, lint-workflows, test, lint-chart]
+    # Same ttl.sh budget as the image legs: the chart push stalls the same way.
+    timeout-minutes: 60
+    steps:
+      - name: Checkout PR code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: 'v4.3.0'
+
+      - name: Point the chart at the PR image
+        run: |
+          set -euo pipefail
+
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          TAG="pr-${PR_NUMBER}-1d"
+
+          yq --inplace ".version = \"0.0.0-pr.${PR_NUMBER}-1d\"" "${CHART_DIR}/Chart.yaml"
+          yq --inplace ".appVersion = \"${TAG}\"" "${CHART_DIR}/Chart.yaml"
+          yq --inplace ".image.repository = \"${CI_IMAGE}\"" "${CHART_DIR}/values.yaml"
+          yq --inplace ".image.tag = \"${TAG}\"" "${CHART_DIR}/values.yaml"
+          # The PR tag moves with every push, so a node must not keep a cached
+          # older build on a rolling restart.
+          yq --inplace ".image.pullPolicy = \"Always\"" "${CHART_DIR}/values.yaml"
+
+          [[ "$(yq '.image.repository' "${CHART_DIR}/values.yaml")" == "${CI_IMAGE}" ]]
+          [[ "$(yq '.image.tag' "${CHART_DIR}/values.yaml")" == "${TAG}" ]]
+
+      - name: Package and push chart to ttl.sh
+        run: |
+          set -euo pipefail
+
+          CHART_VERSION="0.0.0-pr.${{ github.event.pull_request.number }}-1d"
+          helm package "${CHART_DIR}"
+
+          ok=0
+          for attempt in 1 2 3; do
+            if helm push "${CHART_NAME}-${CHART_VERSION}.tgz" oci://ttl.sh/treetscom; then
+              ok=1
+              break
+            fi
+            if [[ "${attempt}" -lt 3 ]]; then
+              echo "helm push failed (attempt ${attempt}); retrying in 5s..."
+              sleep 5
+            fi
+          done
+          [[ "${ok}" -eq 1 ]]
+
+          {
+            echo "## Helm Chart"
+            echo ""
+            echo '```bash'
+            echo "helm install robotlb oci://ttl.sh/treetscom/${CHART_NAME} --version ${CHART_VERSION}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
