@@ -16,6 +16,7 @@
     )
 ]
 
+use backoff::ErrorBackoff;
 use clap::Parser;
 use config::OperatorConfig;
 use error::{redact, RobotLBError, RobotLBResult};
@@ -47,6 +48,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod backoff;
 pub mod config;
 pub mod consts;
 pub mod error;
@@ -124,6 +126,7 @@ pub struct CurrentContext {
     pub config: OperatorConfig,
     pub hcloud_config: HCloudConfig,
     pub rate_limit: Arc<RateLimitGate>,
+    pub error_backoff: Arc<ErrorBackoff>,
 }
 impl CurrentContext {
     #[must_use]
@@ -133,6 +136,7 @@ impl CurrentContext {
             config,
             hcloud_config,
             rate_limit: Arc::default(),
+            error_backoff: Arc::default(),
         }
     }
 }
@@ -147,12 +151,25 @@ pub async fn reconcile_service(
     context: Arc<CurrentContext>,
 ) -> RobotLBResult<Action> {
     let result = sync_service(svc.clone(), context.clone()).await;
+    if ends_backoff(&result) {
+        context.error_backoff.forget(&service_key(&svc));
+    }
     if let Err(error) = &result {
         if publishes_event(error) {
             report_failure(&svc, &context, error).await;
         }
     }
     result
+}
+
+/// A skipped service may have failed back when it was still a robotlb load balancer.
+/// A service waiting at the rate limit gate has not got any closer to succeeding.
+const fn ends_backoff(result: &RobotLBResult<Action>) -> bool {
+    matches!(result, Ok(_) | Err(RobotLBError::SkipService))
+}
+
+fn service_key(svc: &Service) -> String {
+    format!("{}/{}", svc.namespace().unwrap_or_default(), svc.name_any())
 }
 
 /// Skipped services are every service robotlb does not own. A service waiting at the
@@ -607,13 +624,19 @@ async fn clear_ingress_status(svc_api: &kube::Api<Service>, svc: &Service) -> Ro
 /// Handle the error during reconcilation.
 #[allow(clippy::needless_pass_by_value)]
 fn on_error(svc: Arc<Service>, error: &RobotLBError, context: Arc<CurrentContext>) -> Action {
-    let service = format!("{}/{}", svc.namespace().unwrap_or_default(), svc.name_any());
-    error_action(error, &context.rate_limit, Instant::now(), &service)
+    error_action(
+        error,
+        &context.rate_limit,
+        &context.error_backoff,
+        Instant::now(),
+        &service_key(&svc),
+    )
 }
 
 fn error_action(
     error: &RobotLBError,
     rate_limit: &RateLimitGate,
+    backoff: &ErrorBackoff,
     now: Instant,
     service: &str,
 ) -> Action {
@@ -623,7 +646,7 @@ fn error_action(
         error if error.is_rate_limited() => {
             Action::requeue(spread(rate_limit.on_rate_limited(now), service))
         }
-        _ => Action::requeue(Duration::from_secs(30)),
+        _ => Action::requeue(backoff.on_failure(service, now)),
     }
 }
 
@@ -848,7 +871,13 @@ mod tests {
         let wait = std::time::Duration::from_secs(42);
         let error = crate::error::RobotLBError::RateLimited(wait);
         assert_eq!(
-            error_action(&error, &gate, std::time::Instant::now(), "shop/web"),
+            error_action(
+                &error,
+                &gate,
+                &crate::backoff::ErrorBackoff::default(),
+                std::time::Instant::now(),
+                "shop/web"
+            ),
             kube::runtime::controller::Action::requeue(crate::rate_limit::spread(wait, "shop/web"))
         );
     }
@@ -867,7 +896,13 @@ mod tests {
             },
         ));
         assert_eq!(
-            error_action(&error, &gate, now, "shop/web"),
+            error_action(
+                &error,
+                &gate,
+                &crate::backoff::ErrorBackoff::default(),
+                now,
+                "shop/web"
+            ),
             kube::runtime::controller::Action::requeue(crate::rate_limit::spread(
                 std::time::Duration::from_secs(60),
                 "shop/web"
@@ -877,13 +912,55 @@ mod tests {
     }
 
     #[test]
-    fn other_errors_retry_in_30_seconds() {
+    fn other_errors_back_off_per_service() {
         let gate = crate::rate_limit::RateLimitGate::default();
+        let backoff = crate::backoff::ErrorBackoff::default();
+        let now = std::time::Instant::now();
+        let error = crate::error::RobotLBError::HCloudError("boom".to_string());
+        let retry = |service| error_action(&error, &gate, &backoff, now, service);
+        let after =
+            |secs| kube::runtime::controller::Action::requeue(std::time::Duration::from_secs(secs));
+        assert_eq!(retry("shop/web"), after(5));
+        assert_eq!(retry("shop/web"), after(10));
+        assert_eq!(retry("shop/api"), after(5));
+    }
+
+    #[test]
+    fn rate_limits_do_not_lengthen_the_error_backoff() {
+        let gate = crate::rate_limit::RateLimitGate::default();
+        let backoff = crate::backoff::ErrorBackoff::default();
+        let now = std::time::Instant::now();
+        let gated = crate::error::RobotLBError::RateLimited(std::time::Duration::from_secs(42));
+        error_action(&gated, &gate, &backoff, now, "shop/web");
+        let rejected = crate::error::RobotLBError::from(hcloud::apis::Error::<
+            hcloud::apis::load_balancers_api::AddTargetError,
+        >::ResponseError(
+            hcloud::apis::ResponseContent {
+                status: 429_u16.try_into().unwrap(),
+                content: String::new(),
+                entity: None,
+            },
+        ));
+        error_action(&rejected, &gate, &backoff, now, "shop/web");
         let error = crate::error::RobotLBError::HCloudError("boom".to_string());
         assert_eq!(
-            error_action(&error, &gate, std::time::Instant::now(), "shop/web"),
-            kube::runtime::controller::Action::requeue(std::time::Duration::from_secs(30))
+            error_action(&error, &gate, &backoff, now, "shop/web"),
+            kube::runtime::controller::Action::requeue(std::time::Duration::from_secs(5))
         );
+    }
+
+    #[test]
+    fn success_and_skips_end_the_backoff_but_a_closed_gate_does_not() {
+        use crate::error::RobotLBError;
+        use kube::runtime::controller::Action;
+        assert!(super::ends_backoff(&Ok(Action::await_change())));
+        assert!(super::ends_backoff(&Err(RobotLBError::SkipService)));
+        assert!(!super::ends_backoff(&Err(RobotLBError::RateLimited(
+            std::time::Duration::from_secs(1)
+        ))));
+        assert!(!super::ends_backoff(&Err(RobotLBError::HCloudError(
+            "boom".to_string()
+        ))));
     }
 
     #[test]
