@@ -251,7 +251,7 @@ async fn sync_service(svc: Arc<Service>, context: Arc<CurrentContext>) -> RobotL
 
     if role == ServiceRole::Release {
         tracing::info!("Service no longer needs a load balancer. Cleaning up resources.");
-        lb.cleanup(recorded_balancer_id(&svc)).await?;
+        lb.cleanup().await?;
         finalizers::remove(context.client.clone(), &svc).await?;
         return Ok(Action::await_change());
     }
@@ -549,18 +549,6 @@ pub async fn reconcile_load_balancer(
             .as_str(),
     );
 
-    // Releasing the balancer later goes by this ID, since by then the name annotation
-    // may be gone.
-    if let Some(patch) = balancer_id_patch(&svc, hcloud_lb.id) {
-        svc_api
-            .patch(
-                svc.name_any().as_str(),
-                &PatchParams::default(),
-                &kube::api::Patch::Merge(patch),
-            )
-            .await?;
-    }
-
     let mut ingress = vec![];
 
     let dns_ipv4 = hcloud_lb.public_net.ipv4.dns_ptr.flatten();
@@ -603,36 +591,6 @@ pub async fn reconcile_load_balancer(
     Ok(Action::requeue(Duration::from_secs(30)))
 }
 
-/// The value is `<uid>/<id>`: a manifest exported and applied again carries the
-/// annotation along, and only the object it was written for may act on it.
-fn recorded_balancer_id(svc: &Service) -> Option<i64> {
-    let (uid, id) = svc
-        .annotations()
-        .get(consts::LB_ID_ANN_NAME)?
-        .split_once('/')?;
-    if svc.uid().as_deref() != Some(uid) {
-        return None;
-    }
-    // Hetzner IDs are positive; anything else was edited by hand and must not
-    // make every cleanup attempt fail.
-    id.parse().ok().filter(|id| *id > 0)
-}
-
-/// A patch recording the balancer ID, unless the service already carries it.
-fn balancer_id_patch(svc: &Service, id: i64) -> Option<k8s_openapi::serde_json::Value> {
-    let uid = svc.uid()?;
-    if recorded_balancer_id(svc) == Some(id) {
-        return None;
-    }
-    Some(json!({
-        "metadata": {
-            "annotations": {
-                consts::LB_ID_ANN_NAME: format!("{uid}/{id}")
-            }
-        }
-    }))
-}
-
 /// Handle the error during reconcilation.
 #[allow(clippy::needless_pass_by_value)]
 fn on_error(svc: Arc<Service>, error: &RobotLBError, context: Arc<CurrentContext>) -> Action {
@@ -659,9 +617,9 @@ fn error_action(
 #[cfg(test)]
 mod tests {
     use super::{
-        balancer_id_patch, collect_lb_services, consts, error_action, event_note,
-        is_excluded_from_lb, is_lb_eligible_node, is_local_traffic_policy, node_source,
-        publishes_event, recorded_balancer_id, service_role, NodeSource, ServiceRole,
+        collect_lb_services, consts, error_action, event_note, is_excluded_from_lb,
+        is_lb_eligible_node, is_local_traffic_policy, node_source, publishes_event, service_role,
+        NodeSource, ServiceRole,
     };
     use k8s_openapi::{
         api::core::v1::{
@@ -1034,52 +992,5 @@ mod tests {
         let error = crate::error::RobotLBError::NoExposablePorts;
         assert!(publishes_event(&error));
         assert!(error.to_string().starts_with("No TCP port"));
-    }
-
-    fn annotated(value: &str) -> Service {
-        Service {
-            metadata: ObjectMeta {
-                uid: Some("uid-1".to_string()),
-                annotations: Some(BTreeMap::from([(
-                    consts::LB_ID_ANN_NAME.to_string(),
-                    value.to_string(),
-                )])),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn the_recorded_balancer_id_is_read_back() {
-        assert_eq!(recorded_balancer_id(&annotated("uid-1/4711")), Some(4711));
-        assert_eq!(recorded_balancer_id(&annotated("uid-1/not-a-number")), None);
-        assert_eq!(recorded_balancer_id(&annotated("uid-1/0")), None);
-        assert_eq!(recorded_balancer_id(&annotated("uid-1/-1")), None);
-        assert_eq!(recorded_balancer_id(&annotated("4711")), None);
-        assert_eq!(recorded_balancer_id(&Service::default()), None);
-    }
-
-    // A manifest exported with kubectl and applied under another name keeps the
-    // annotation, and must not release the original service's balancer.
-    #[test]
-    fn an_id_recorded_for_another_object_is_ignored() {
-        assert_eq!(recorded_balancer_id(&annotated("uid-2/4711")), None);
-    }
-
-    #[test]
-    fn the_balancer_id_is_recorded_only_when_it_changes() {
-        assert!(balancer_id_patch(&annotated("uid-1/4711"), 4711).is_none());
-        let patch = balancer_id_patch(&annotated("uid-1/4711"), 4712).unwrap();
-        assert_eq!(
-            patch["metadata"]["annotations"][consts::LB_ID_ANN_NAME],
-            "uid-1/4712"
-        );
-        let copied = balancer_id_patch(&annotated("uid-2/4711"), 4711).unwrap();
-        assert_eq!(
-            copied["metadata"]["annotations"][consts::LB_ID_ANN_NAME],
-            "uid-1/4711"
-        );
-        assert!(balancer_id_patch(&Service::default(), 1).is_none());
     }
 }
