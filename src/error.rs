@@ -152,6 +152,29 @@ pub fn describe<T>(error: &hcloud::apis::Error<T>) -> String {
     )
 }
 
+/// Whether Hetzner refused the call for a reason that may pass on its own.
+///
+/// That is a balancer locked by a running action (error code `locked`, HTTP 423), a
+/// resource changed during the request (`conflict`, HTTP 409), Robot being briefly
+/// unavailable (`robot_unavailable`), or a failure on the API side (5xx).
+/// A 429 is not temporary here: the rate limit gate owns it.
+#[must_use]
+pub fn is_temporary_rejection<T>(error: &hcloud::apis::Error<T>) -> bool {
+    let hcloud::apis::Error::ResponseError(response) = error else {
+        return false;
+    };
+    let code = k8s_openapi::serde_json::from_str::<k8s_openapi::serde_json::Value>(
+        &response.content,
+    )
+    .map(|body| {
+        body.pointer("/error/code")
+            .and_then(|code| code.as_str())
+            .map(str::to_owned)
+    });
+    let retryable = matches!(code, Ok(Some(code)) if matches!(code.as_str(), "locked" | "conflict" | "robot_unavailable"));
+    retryable || response.status.is_server_error()
+}
+
 /// Replace the API token, or any prefix of it long enough to identify it, with a marker.
 /// Hetzner quotes the start of the token in some error messages.
 #[must_use]
@@ -246,5 +269,59 @@ mod tests {
     fn other_statuses_are_not_a_rate_limit() {
         assert!(!RobotLBError::from(response_error(500, "")).is_rate_limited());
         assert!(!RobotLBError::SkipService.is_rate_limited());
+    }
+
+    #[test]
+    fn a_locked_balancer_is_temporary() {
+        let body = r#"{"error": {"code": "locked", "message": "item is locked"}}"#;
+        assert!(super::is_temporary_rejection(&response_error(423, body)));
+        assert!(super::is_temporary_rejection(&response_error(409, body)));
+    }
+
+    #[test]
+    fn a_conflicting_change_is_temporary() {
+        let body = r#"{"error": {"code": "conflict", "message": "please retry"}}"#;
+        assert!(super::is_temporary_rejection(&response_error(409, body)));
+    }
+
+    #[test]
+    fn an_unavailable_robot_is_temporary() {
+        let body = r#"{"error": {"code": "robot_unavailable", "message": "retry later"}}"#;
+        assert!(super::is_temporary_rejection(&response_error(422, body)));
+    }
+
+    #[test]
+    fn a_protected_balancer_is_permanent() {
+        let body = r#"{"error": {"code": "protected", "message": "protected"}}"#;
+        assert!(!super::is_temporary_rejection(&response_error(423, body)));
+    }
+
+    #[test]
+    fn a_server_error_is_temporary() {
+        assert!(super::is_temporary_rejection(&response_error(500, "")));
+        assert!(super::is_temporary_rejection(&response_error(
+            503,
+            "<html></html>"
+        )));
+    }
+
+    #[test]
+    fn a_rate_limit_is_not_temporary() {
+        let body = r#"{"error": {"code": "rate_limit_exceeded", "message": "slow down"}}"#;
+        assert!(!super::is_temporary_rejection(&response_error(429, body)));
+    }
+
+    #[test]
+    fn a_target_outside_the_subnet_is_permanent() {
+        let body = r#"{"error": {"code": "invalid_input", "message": "not in subnet"}}"#;
+        assert!(!super::is_temporary_rejection(&response_error(422, body)));
+        assert!(!super::is_temporary_rejection(&response_error(404, "")));
+    }
+
+    #[test]
+    fn a_transport_failure_is_not_temporary() {
+        let error: Error<ListLoadBalancersError> =
+            Error::Serde(k8s_openapi::serde_json::from_str::<()>("x").unwrap_err());
+        assert!(!super::is_temporary_rejection(&error));
     }
 }
