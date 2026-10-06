@@ -701,9 +701,9 @@ fn error_action(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_lb_services, consts, error_action, event_note, is_excluded_from_lb,
-        is_lb_eligible_node, is_local_traffic_policy, node_source, publishes_event, service_role,
-        slice_triggers, success_requeue, NodeSource, ServiceRole,
+        NodeSource, ServiceRole, collect_lb_services, consts, error_action, event_note,
+        is_excluded_from_lb, is_lb_eligible_node, is_local_traffic_policy, node_source,
+        publishes_event, service_role, slice_triggers, success_requeue,
     };
     use k8s_openapi::{
         api::core::v1::{
