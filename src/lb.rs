@@ -172,14 +172,15 @@ impl LoadBalancer {
 
     /// Reconcile the load balancer to match the desired configuration.
     #[tracing::instrument(skip(self), fields(lb_name=self.name))]
-    pub async fn reconcile(&self) -> RobotLBResult<hcloud::models::LoadBalancer> {
+    /// Returns the balancer, and whether some of its targets could not be added.
+    pub async fn reconcile(&self) -> RobotLBResult<(hcloud::models::LoadBalancer, bool)> {
         let hcloud_balancer = self.get_or_create_hcloud_lb().await?;
         self.reconcile_algorithm(&hcloud_balancer).await?;
         self.reconcile_lb_type(&hcloud_balancer).await?;
         self.reconcile_network(&hcloud_balancer).await?;
         self.reconcile_services(&hcloud_balancer).await?;
-        self.reconcile_targets(&hcloud_balancer).await?;
-        Ok(hcloud_balancer)
+        let targets_missing = self.reconcile_targets(&hcloud_balancer).await?;
+        Ok((hcloud_balancer, targets_missing))
     }
 
     /// Reconcile the services of the load balancer.
@@ -299,7 +300,7 @@ impl LoadBalancer {
     async fn reconcile_targets(
         &self,
         hcloud_balancer: &hcloud::models::LoadBalancer,
-    ) -> RobotLBResult<()> {
+    ) -> RobotLBResult<bool> {
         let max_targets =
             usize::try_from(hcloud_balancer.load_balancer_type.max_targets).unwrap_or(usize::MAX);
         let planned = plan_targets(&self.targets, max_targets);
@@ -386,7 +387,7 @@ impl LoadBalancer {
                 last_error.unwrap_or_else(|| "no reason reported".to_string()),
             )));
         }
-        Ok(())
+        Ok(live < planned.len())
     }
 
     /// Reconcile the load balancer algorithm.
