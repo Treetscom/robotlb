@@ -574,13 +574,13 @@ impl LoadBalancer {
             return Ok(Some(balancer));
         }
         for (name, legacy) in candidate_names(purpose, &self.name, self.legacy_name.as_deref()) {
-            let named = self
+            let listed = self
                 .list_hcloud_lbs(ListLoadBalancersParams {
                     name: Some(name.to_string()),
                     ..Default::default()
                 })
                 .await?;
-            let Some(balancer) = single(named, name)? else {
+            let Some(balancer) = single(named(listed, name, |lb| &lb.name), name)? else {
                 continue;
             };
             match decide(&balancer, &self.service_uid, &self.targets, legacy) {
@@ -685,8 +685,9 @@ impl LoadBalancer {
             },
         )
         .await?;
+        let networks = named(response.networks, &network_name, |network| &network.name);
 
-        if response.networks.len() > 1 {
+        if networks.len() > 1 {
             tracing::warn!(
                 "Found more than one network with name {}, skipping",
                 network_name
@@ -696,7 +697,7 @@ impl LoadBalancer {
                 network_name,
             )));
         }
-        if response.networks.is_empty() {
+        if networks.is_empty() {
             tracing::warn!("Network with name {} not found", network_name);
             return Err(RobotLBError::HCloudError(format!(
                 "Network with name {} not found",
@@ -704,7 +705,7 @@ impl LoadBalancer {
             )));
         }
 
-        Ok(response.networks.into_iter().next())
+        Ok(networks.into_iter().next())
     }
 }
 
@@ -836,6 +837,13 @@ fn decide(
     }
 }
 
+/// The API matches a name filter exactly, except that it ignores an empty one and
+/// returns everything in the project.
+fn named<T>(mut found: Vec<T>, name: &str, name_of: impl Fn(&T) -> &str) -> Vec<T> {
+    found.retain(|item| name_of(item) == name);
+    found
+}
+
 fn single<T>(mut found: Vec<T>, what: &str) -> RobotLBResult<Option<T>> {
     if found.len() > 1 {
         return Err(RobotLBError::AmbiguousBalancer(what.to_string()));
@@ -880,14 +888,14 @@ impl From<LBAlgorithm> for LoadBalancerAlgorithm {
 #[cfg(test)]
 mod tests {
     use super::{
-        candidate_names, decide, default_name, fnv1a64, owner_labels, owner_selector,
+        candidate_names, decide, default_name, fnv1a64, named, owner_labels, owner_selector,
         parse_cluster_name, plan_targets, single, Decision, LoadBalancer, Purpose,
     };
     use crate::{consts, error::RobotLBError};
     use hcloud::apis::configuration::Configuration as HcloudConfig;
     use hcloud::models::{
         load_balancer_target, LoadBalancer as HcloudBalancer, LoadBalancerTarget,
-        LoadBalancerTargetIp,
+        LoadBalancerTargetIp, Network,
     };
     use k8s_openapi::{api::core::v1::Service, apimachinery::pkg::apis::meta::v1::ObjectMeta};
     use std::collections::HashMap;
@@ -1092,6 +1100,35 @@ mod tests {
             candidate_names(Purpose::Reconcile, "custom", None),
             vec![("custom", false)]
         );
+    }
+
+    #[test]
+    fn only_balancers_with_exactly_the_name_are_kept() {
+        let found = ["web", "Web", "web ", "web.shop"]
+            .map(|name| HcloudBalancer {
+                name: name.to_string(),
+                ..Default::default()
+            })
+            .to_vec();
+        let kept = named(found.clone(), "web", |lb| &lb.name);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name, "web");
+        // The API ignores an empty name filter and returns every balancer.
+        assert!(named(found, "", |lb| &lb.name).is_empty());
+    }
+
+    #[test]
+    fn only_networks_with_exactly_the_name_are_kept() {
+        let found = ["lan", "LAN", "lan ", "lan2"]
+            .map(|name| Network {
+                name: name.to_string(),
+                ..Default::default()
+            })
+            .to_vec();
+        let kept = named(found.clone(), "lan", |network| &network.name);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name, "lan");
+        assert!(named(found, "", |network| &network.name).is_empty());
     }
 
     #[test]
