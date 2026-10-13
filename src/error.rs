@@ -163,16 +163,27 @@ pub fn is_temporary_rejection<T>(error: &hcloud::apis::Error<T>) -> bool {
     let hcloud::apis::Error::ResponseError(response) = error else {
         return false;
     };
-    let code = k8s_openapi::serde_json::from_str::<k8s_openapi::serde_json::Value>(
-        &response.content,
-    )
-    .map(|body| {
-        body.pointer("/error/code")
-            .and_then(|code| code.as_str())
-            .map(str::to_owned)
-    });
-    let retryable = matches!(code, Ok(Some(code)) if matches!(code.as_str(), "locked" | "conflict" | "robot_unavailable"));
-    retryable || response.status.is_server_error()
+    matches!(
+        error_code(error).as_deref(),
+        Some("locked" | "conflict" | "robot_unavailable")
+    ) || response.status.is_server_error()
+}
+
+/// Whether Hetzner refused to add a target because the balancer already has it, which
+/// is what a retry gets after a call that Hetzner applied but answered with a 5xx.
+#[must_use]
+pub fn is_target_already_defined<T>(error: &hcloud::apis::Error<T>) -> bool {
+    error_code(error).as_deref() == Some("target_already_defined")
+}
+
+fn error_code<T>(error: &hcloud::apis::Error<T>) -> Option<String> {
+    let hcloud::apis::Error::ResponseError(response) = error else {
+        return None;
+    };
+    let body =
+        k8s_openapi::serde_json::from_str::<k8s_openapi::serde_json::Value>(&response.content)
+            .ok()?;
+    body.pointer("/error/code")?.as_str().map(str::to_owned)
 }
 
 /// Replace the API token, or any prefix of it long enough to identify it, with a marker.
@@ -316,6 +327,25 @@ mod tests {
         let body = r#"{"error": {"code": "invalid_input", "message": "not in subnet"}}"#;
         assert!(!super::is_temporary_rejection(&response_error(422, body)));
         assert!(!super::is_temporary_rejection(&response_error(404, "")));
+    }
+
+    #[test]
+    fn an_already_defined_target_is_recognised() {
+        let body = r#"{"error": {"code": "target_already_defined", "message": "already added"}}"#;
+        assert!(super::is_target_already_defined(&response_error(409, body)));
+        assert!(super::is_target_already_defined(&response_error(422, body)));
+    }
+
+    #[test]
+    fn other_rejections_are_not_an_already_defined_target() {
+        let body = r#"{"error": {"code": "locked", "message": "item is locked"}}"#;
+        assert!(!super::is_target_already_defined(&response_error(
+            423, body
+        )));
+        assert!(!super::is_target_already_defined(&response_error(500, "")));
+        let error: Error<ListLoadBalancersError> =
+            Error::Serde(k8s_openapi::serde_json::from_str::<()>("x").unwrap_err());
+        assert!(!super::is_target_already_defined(&error));
     }
 
     #[test]
