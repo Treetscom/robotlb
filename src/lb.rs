@@ -44,7 +44,7 @@ enum LBAlgorithm {
 /// Struct representing a load balancer
 /// It holds all the necessary information to manage the load balancer
 /// in Hetzner Cloud.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct LoadBalancer {
     pub name: String,
     /// The name earlier releases gave the balancer, when it differs from `name`.
@@ -163,6 +163,17 @@ impl LoadBalancer {
             services: HashMap::default(),
             targets: Vec::default(),
             hcloud_config: context.hcloud_config.clone(),
+        })
+    }
+
+    /// A load balancer that is only good for `cleanup`, which finds the balancer by the
+    /// service UID alone. The annotations are not read: one that does not parse must
+    /// not keep the service from being released.
+    pub fn for_release(svc: &Service, hcloud_config: HcloudConfig) -> RobotLBResult<Self> {
+        Ok(Self {
+            service_uid: svc.uid().ok_or(RobotLBError::SkipService)?,
+            hcloud_config,
+            ..Default::default()
         })
     }
 
@@ -893,13 +904,15 @@ where
 mod tests {
     use super::{
         candidate_names, decide, default_name, owner_labels, owner_selector, plan_targets, single,
-        Decision, Purpose,
+        Decision, LoadBalancer, Purpose,
     };
     use crate::{consts, error::RobotLBError};
+    use hcloud::apis::configuration::Configuration as HcloudConfig;
     use hcloud::models::{
         load_balancer_target, LoadBalancer as HcloudBalancer, LoadBalancerTarget,
         LoadBalancerTargetIp,
     };
+    use k8s_openapi::{api::core::v1::Service, apimachinery::pkg::apis::meta::v1::ObjectMeta};
     use std::collections::HashMap;
 
     #[test]
@@ -1140,5 +1153,20 @@ mod tests {
             single(vec![1, 2], "x"),
             Err(RobotLBError::AmbiguousBalancer(_))
         ));
+    }
+    #[test]
+    fn a_release_ignores_annotations_that_do_not_parse() {
+        let svc = Service {
+            metadata: ObjectMeta {
+                uid: Some("uid-1".to_string()),
+                annotations: Some(
+                    [(consts::LB_RETRIES_ANN_NAME.to_string(), "abc".to_string())].into(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let lb = LoadBalancer::for_release(&svc, HcloudConfig::default()).unwrap();
+        assert_eq!(lb.service_uid, "uid-1");
     }
 }
