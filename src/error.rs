@@ -285,6 +285,21 @@ mod tests {
         assert!(!RobotLBError::SkipService.is_rate_limited());
     }
 
+    // A misconfigured annotation is the user's problem, not Hetzner's, so it
+    // must not close the rate limit gate.
+    #[test]
+    fn an_unknown_ip_type_is_not_a_rate_limit() {
+        assert!(!RobotLBError::UnknownIPType.is_rate_limited());
+    }
+
+    #[test]
+    fn the_unknown_ip_type_error_names_the_allowed_values() {
+        assert_eq!(
+            RobotLBError::UnknownIPType.to_string(),
+            "Unknown IP Type. Only VIP or Proxy are allowed."
+        );
+    }
+
     #[test]
     fn a_locked_balancer_is_temporary() {
         let body = r#"{"error": {"code": "locked", "message": "item is locked"}}"#;

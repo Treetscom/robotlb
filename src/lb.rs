@@ -882,4 +882,75 @@ mod tests {
         let desired = vec!["192.168.100.2".to_string(), "192.168.100.3".to_string()];
         assert_eq!(plan_targets(&desired, 25).len(), 2);
     }
+
+    use super::LoadBalancer;
+    use crate::{
+        config::OperatorConfig, consts, error::RobotLBError, ip_type::IPMode, CurrentContext,
+    };
+    use clap::Parser;
+    use k8s_openapi::{api::core::v1::Service, apimachinery::pkg::apis::meta::v1::ObjectMeta};
+    use std::collections::BTreeMap;
+
+    fn context_with_ip_mode(default_ip_mode: IPMode) -> CurrentContext {
+        let mut config =
+            OperatorConfig::try_parse_from(["robotlb", "--hcloud-token", "t"]).unwrap();
+        config.default_ip_mode = default_ip_mode;
+        // No cluster is needed: the client is only built, never used.
+        let client =
+            kube::Client::try_from(kube::Config::new("https://127.0.0.1:6443".parse().unwrap()))
+                .unwrap();
+        let mut hcloud_config = super::HcloudConfig::new();
+        hcloud_config.bearer_access_token = Some("t".to_string());
+        CurrentContext::new(client, config, hcloud_config)
+    }
+
+    fn service_with_ip_type(ip_type: Option<&str>) -> Service {
+        let mut annotations = BTreeMap::new();
+        if let Some(ip_type) = ip_type {
+            annotations.insert(
+                consts::LB_IP_TYPE_LABEL_NAME.to_string(),
+                ip_type.to_string(),
+            );
+        }
+        Service {
+            metadata: ObjectMeta {
+                name: Some("web".to_string()),
+                annotations: Some(annotations),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn is_proxy(mode: IPMode) -> bool {
+        matches!(mode, IPMode::Proxy)
+    }
+
+    #[tokio::test]
+    async fn a_missing_ip_type_annotation_falls_back_to_the_default() {
+        let svc = service_with_ip_type(None);
+        let lb = LoadBalancer::try_from_svc(&svc, &context_with_ip_mode(IPMode::VIP)).unwrap();
+        assert!(!is_proxy(lb.ip_type));
+        let lb = LoadBalancer::try_from_svc(&svc, &context_with_ip_mode(IPMode::Proxy)).unwrap();
+        assert!(is_proxy(lb.ip_type));
+    }
+
+    #[tokio::test]
+    async fn an_ip_type_annotation_overrides_the_default() {
+        let svc = service_with_ip_type(Some("Proxy"));
+        let lb = LoadBalancer::try_from_svc(&svc, &context_with_ip_mode(IPMode::VIP)).unwrap();
+        assert!(is_proxy(lb.ip_type));
+        let svc = service_with_ip_type(Some("VIP"));
+        let lb = LoadBalancer::try_from_svc(&svc, &context_with_ip_mode(IPMode::Proxy)).unwrap();
+        assert!(!is_proxy(lb.ip_type));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_ip_type_annotation_is_rejected() {
+        let svc = service_with_ip_type(Some("vip"));
+        assert!(matches!(
+            LoadBalancer::try_from_svc(&svc, &context_with_ip_mode(IPMode::VIP)),
+            Err(RobotLBError::UnknownIPType)
+        ));
+    }
 }
