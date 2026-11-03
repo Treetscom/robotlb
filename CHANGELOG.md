@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.6](https://github.com/forkline/robotlb/tree/0.7.6) - 2026-11-03
+
+### Fixed
+
+- Patch hcloud to handle missing `deprecated` field in Hetzner Cloud API responses. The API removed this field in November 2026, causing deserialization failures with error: `missing field 'deprecated'`. Added `#[serde(default)]` to make the field optional. ([#83](https://github.com/Treetscom/robotlb/pull/83))
+
 ## [0.7.5](https://github.com/forkline/robotlb/tree/0.7.5) - 2026-11-03
 
 ### Build
