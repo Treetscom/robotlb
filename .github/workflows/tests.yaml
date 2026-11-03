@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
       - name: Build locked release image
         run: docker buildx build --platform linux/amd64 --load --progress=plain -t robotlb:pr .
       - name: Verify runtime dependencies and CLI startup
