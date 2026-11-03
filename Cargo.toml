@@ -31,6 +31,9 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.7"
 
+[patch.crates-io]
+hcloud = { git = "https://github.com/pando85/hcloud-rust", branch = "fix/missing-deprecated-field-default" }
+
 [profile.release]
 codegen-units = 1
 lto = true
