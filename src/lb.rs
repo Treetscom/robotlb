@@ -21,10 +21,9 @@ use kube::ResourceExt;
 use std::{collections::HashMap, str::FromStr};
 
 use crate::{
-    consts,
+    CurrentContext, consts,
     error::{RobotLBError, RobotLBResult},
     ip_type::IPMode,
-    CurrentContext,
 };
 
 /// Retries after the first attempt, sleeping 1 unit, 2 units, ... between them.
@@ -792,7 +791,7 @@ mod tests {
     }
 
     use super::retry_temporary;
-    use hcloud::apis::{load_balancers_api::AddTargetError, Error, ResponseContent};
+    use hcloud::apis::{Error, ResponseContent, load_balancers_api::AddTargetError};
     use std::{
         sync::atomic::{AtomicU32, Ordering},
         time::Duration,
@@ -885,7 +884,7 @@ mod tests {
 
     use super::LoadBalancer;
     use crate::{
-        config::OperatorConfig, consts, error::RobotLBError, ip_type::IPMode, CurrentContext,
+        CurrentContext, config::OperatorConfig, consts, error::RobotLBError, ip_type::IPMode,
     };
     use clap::Parser;
     use k8s_openapi::{api::core::v1::Service, apimachinery::pkg::apis::meta::v1::ObjectMeta};

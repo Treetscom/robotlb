@@ -1,10 +1,10 @@
 use k8s_openapi::{
     api::core::v1::Service,
-    serde_json::{json, Value},
+    serde_json::{Value, json},
 };
 use kube::{
-    api::{Patch, PatchParams},
     Api, Client, ResourceExt,
+    api::{Patch, PatchParams},
 };
 
 use crate::{

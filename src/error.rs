@@ -205,8 +205,8 @@ pub fn redact(message: &str, token: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{describe, is_rate_limit_response, redact, RobotLBError};
-    use hcloud::apis::{load_balancers_api::ListLoadBalancersError, Error, ResponseContent};
+    use super::{RobotLBError, describe, is_rate_limit_response, redact};
+    use hcloud::apis::{Error, ResponseContent, load_balancers_api::ListLoadBalancersError};
 
     const TOKEN: &str = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ01";
 
