@@ -1886,6 +1886,7 @@ dependencies = [
  "hcloud",
  "k8s-openapi",
  "kube",
+ "serde",
  "thiserror 2.0.3",
  "tikv-jemallocator",
  "tokio",

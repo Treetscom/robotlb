@@ -1,3 +1,4 @@
+use crate::ip_type::IPMode;
 use clap::Parser;
 use tracing::level_filters::LevelFilter;
 
@@ -30,13 +31,13 @@ pub struct OperatorConfig {
     pub default_lb_interval: i32,
 
     /// Default location of a load balancer.
-    /// https://docs.hetzner.com/cloud/general/locations/
+    /// <https://docs.hetzner.com/cloud/general/locations>/
     #[arg(long, env = "ROBOTLB_DEFAULT_LB_LOCATION", default_value = "hel1")]
     pub default_lb_location: String,
 
     /// Type of a load balancer. It differs in price, number of connections,
     /// target servers, etc. The default value is the smallest balancer.
-    /// https://docs.hetzner.com/cloud/load-balancers/overview#pricing
+    /// <https://docs.hetzner.com/cloud/load-balancers/overview#pricing>
     #[arg(long, env = "ROBOTLB_DEFAULT_LB_TYPE", default_value = "lb11")]
     pub default_balancer_type: String,
 
@@ -44,7 +45,8 @@ pub struct OperatorConfig {
     /// Possible values:
     /// * `least-connections`
     /// * `round-robin`
-    /// https://docs.hetzner.com/cloud/load-balancers/overview#load-balancers
+    ///
+    /// <https://docs.hetzner.com/cloud/load-balancers/overview#load-balancers>
     #[arg(
         long,
         env = "ROBOTLB_DEFAULT_LB_ALGORITHM",
@@ -54,13 +56,16 @@ pub struct OperatorConfig {
 
     /// Default load balancer proxy mode. If enabled, the load balancer will
     /// act as a proxy for the target servers. The default value is `false`.
-    /// https://docs.hetzner.com/cloud/load-balancers/faq/#what-does-proxy-protocol-mean-and-should-i-enable-it
+    /// <https://docs.hetzner.com/cloud/load-balancers/faq/#what-does-proxy-protocol-mean-and-should-i-enable-it>
     #[arg(
         long,
         env = "ROBOTLB_DEFAULT_LB_PROXY_MODE_ENABLED",
         default_value = "false"
     )]
     pub default_lb_proxy_mode_enabled: bool,
+
+    #[arg(long, env = "ROBOTLB_DEFAULT_IP_MODE", default_value = "VIP")]
+    pub default_ip_mode: IPMode,
 
     /// Whether to enable IPv6 ingress for the load balancer.
     /// If enabled, the load balancer's IPv6 will be attached to the service as an external IP along with IPv4.

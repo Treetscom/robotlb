@@ -35,7 +35,7 @@ pub fn check(service: &Service) -> bool {
         .metadata
         .finalizers
         .as_ref()
-        .map_or(false, |finalizers| {
+        .is_some_and(|finalizers| {
             finalizers.contains(&consts::FINALIZER_NAME.to_string())
         })
 }

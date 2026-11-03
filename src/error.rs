@@ -85,6 +85,8 @@ pub enum RobotLBError {
     HcloudListLoadBalancersError(
         #[from] hcloud::apis::Error<hcloud::apis::load_balancers_api::ListLoadBalancersError>,
     ),
+    #[error("Unknown IP Type. Only VIP or Proxy are allowed.")]
+    UnknownIPType,
 }
 
 impl RobotLBError {
@@ -115,6 +117,7 @@ impl RobotLBError {
             | Self::HCloudError(_)
             | Self::KubeError(_)
             | Self::UnknownLBAlgorithm
+            | Self::UnknownIPType
             | Self::ServiceWithoutSelector
             | Self::RateLimited(_) => false,
         }

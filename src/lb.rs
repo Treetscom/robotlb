@@ -23,6 +23,7 @@ use std::{collections::HashMap, str::FromStr};
 use crate::{
     consts,
     error::{RobotLBError, RobotLBResult},
+    ip_type::IPMode,
     CurrentContext,
 };
 
@@ -60,6 +61,7 @@ pub struct LoadBalancer {
     pub balancer_type: String,
     pub algorithm: LoadBalancerAlgorithm,
     pub network_name: Option<String>,
+    pub ip_type: IPMode,
 
     pub hcloud_config: HcloudConfig,
 }
@@ -135,12 +137,20 @@ impl LoadBalancer {
             .annotations()
             .get(consts::LB_NAME_LABEL_NAME)
             .cloned()
-            .unwrap_or(svc.name_any());
+            .unwrap_or_else(|| svc.name_any());
 
         let private_ip = svc
             .annotations()
             .get(consts::LB_PRIVATE_IP_LABEL_NAME)
             .cloned();
+
+        let ip_type = svc
+            .annotations()
+            .get(consts::LB_IP_TYPE_LABEL_NAME)
+            .map(String::as_str)
+            .map(IPMode::from_str)
+            .transpose()?
+            .unwrap_or(context.config.default_ip_mode);
 
         Ok(Self {
             name,
@@ -152,6 +162,7 @@ impl LoadBalancer {
             location,
             proxy_mode,
             network_name,
+            ip_type,
             algorithm: algorithm.into(),
             services: HashMap::default(),
             targets: Vec::default(),
@@ -424,7 +435,7 @@ impl LoadBalancer {
         &self,
         hcloud_balancer: &hcloud::models::LoadBalancer,
     ) -> RobotLBResult<()> {
-        if *hcloud_balancer.algorithm == self.algorithm.clone().into() {
+        if *hcloud_balancer.algorithm == self.algorithm.clone() {
             return Ok(());
         }
         tracing::info!(
@@ -437,7 +448,7 @@ impl LoadBalancer {
                 &self.hcloud_config,
                 ChangeAlgorithmParams {
                     id: hcloud_balancer.id,
-                    body: Some(self.algorithm.clone().into()),
+                    body: Some(self.algorithm.clone()),
                 },
             )
         })
@@ -613,7 +624,7 @@ impl LoadBalancer {
         let hcloud_balancers = hcloud::apis::load_balancers_api::list_load_balancers(
             &self.hcloud_config,
             ListLoadBalancersParams {
-                name: Some(self.name.to_string()),
+                name: Some(self.name.clone()),
                 ..Default::default()
             },
         )
@@ -688,15 +699,13 @@ impl LoadBalancer {
                 network_name
             );
             return Err(RobotLBError::HCloudError(format!(
-                "Found more than one network with name {}",
-                network_name,
+                "Found more than one network with name {network_name}",
             )));
         }
         if response.networks.is_empty() {
             tracing::warn!("Network with name {} not found", network_name);
             return Err(RobotLBError::HCloudError(format!(
-                "Network with name {} not found",
-                network_name,
+                "Network with name {network_name} not found",
             )));
         }
 
