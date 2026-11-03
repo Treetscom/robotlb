@@ -19,7 +19,7 @@
 use backoff::ErrorBackoff;
 use clap::Parser;
 use config::OperatorConfig;
-use error::{redact, RobotLBError, RobotLBResult};
+use error::{RobotLBError, RobotLBResult, redact};
 use futures::StreamExt;
 use hcloud::apis::configuration::Configuration as HCloudConfig;
 use k8s_openapi::{
@@ -30,17 +30,18 @@ use k8s_openapi::{
     serde_json::json,
 };
 use kube::{
+    Resource, ResourceExt,
     api::{ListParams, PatchParams},
     runtime::{
+        Controller, WatchStreamExt,
         controller::{self, Action},
         events::{Event, EventType, Recorder, Reporter},
-        watcher, Controller, WatchStreamExt,
+        watcher,
     },
-    Resource, ResourceExt,
 };
 use label_filter::LabelFilter;
 use lb::{LBService, LoadBalancer};
-use rate_limit::{spread, RateLimitGate};
+use rate_limit::{RateLimitGate, spread};
 use std::{
     collections::HashSet,
     str::FromStr,
@@ -183,11 +184,13 @@ fn cluster_changes(
     let node_client = client.clone();
     tokio::spawn(async move {
         let mut changes = triggers::NodeChanges::default();
-        let mut events = std::pin::pin!(watcher::watcher(
-            kube::Api::<Node>::all(node_client),
-            watcher::Config::default()
-        )
-        .default_backoff());
+        let mut events = std::pin::pin!(
+            watcher::watcher(
+                kube::Api::<Node>::all(node_client),
+                watcher::Config::default()
+            )
+            .default_backoff()
+        );
         while let Some(event) = events.next().await {
             match event {
                 Ok(event) => {
@@ -203,11 +206,13 @@ fn cluster_changes(
     // `Controller::reconcile_on` can target one. Once kube-runtime stabilizes it,
     // send the slice's service there instead and drop this watch's reconcile-all.
     tokio::spawn(async move {
-        let mut events = std::pin::pin!(watcher::metadata_watcher(
-            kube::Api::<EndpointSlice>::all(client),
-            watcher::Config::default()
-        )
-        .default_backoff());
+        let mut events = std::pin::pin!(
+            watcher::metadata_watcher(
+                kube::Api::<EndpointSlice>::all(client),
+                watcher::Config::default()
+            )
+            .default_backoff()
+        );
         while let Some(event) = events.next().await {
             match event {
                 Ok(event) => {
@@ -256,10 +261,10 @@ pub async fn reconcile_service(
     if ends_backoff(&result) {
         context.error_backoff.forget(&service_key(&svc));
     }
-    if let Err(error) = &result {
-        if publishes_event(error) {
-            report_failure(&svc, &context, error).await;
-        }
+    if let Err(error) = &result
+        && publishes_event(error)
+    {
+        report_failure(&svc, &context, error).await;
     }
     result
 }
@@ -605,14 +610,14 @@ pub async fn reconcile_load_balancer(
             "ipMode": &lb.ip_type
         }));
     }
-    if context.config.ipv6_ingress {
-        if let Some(ipv6) = &ipv6 {
-            ingress.push(json!({
-                "ip": ipv6,
-                "dns": dns_ipv6,
-                "ipMode": &lb.ip_type
-            }));
-        }
+    if context.config.ipv6_ingress
+        && let Some(ipv6) = &ipv6
+    {
+        ingress.push(json!({
+            "ip": ipv6,
+            "dns": dns_ipv6,
+            "ipMode": &lb.ip_type
+        }));
     }
 
     if !ingress.is_empty() {
@@ -708,9 +713,9 @@ fn error_action(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_lb_services, consts, error_action, event_note, is_excluded_from_lb,
+        NodeSource, collect_lb_services, consts, error_action, event_note, is_excluded_from_lb,
         is_lb_eligible_node, is_local_traffic_policy, node_source, publishes_event, slice_triggers,
-        success_requeue, NodeSource,
+        success_requeue,
     };
     use k8s_openapi::{
         api::core::v1::{
