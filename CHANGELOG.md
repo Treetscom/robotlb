@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.5](https://github.com/forkline/robotlb/tree/0.7.5) - 2026-11-03
+
+### Build
+
+- deps: Update Rust crate async-trait to v0.1.92 (#97) ([6eb5bfa](https://github.com/forkline/robotlb/commit/6eb5bfa987883ade843510b993c748ca93ea9c49))
+- deps: Update actions/checkout action to v7 (#106) ([394d82e](https://github.com/forkline/robotlb/commit/394d82ef9a0a6248e76cbb10fad8f7835269cae7))
+- deps: Update Rust crate tikv-jemallocator to 0.7 (#103) ([69d40bd](https://github.com/forkline/robotlb/commit/69d40bd226b327bddd4664392a52832e1df89390))
+- deps: Update Rust crate tower-http to 0.7.0 (#104) ([8628913](https://github.com/forkline/robotlb/commit/8628913a7babc4f461c6ccd63e653c43d69017aa))
+- deps: Update Rust crate hyper-util to v0.1.21 (#95) ([50007a4](https://github.com/forkline/robotlb/commit/50007a41f799ee9c338bf507f7dd4e533e12d3df))
+- deps: Update Rust crate futures to v0.3.34 (#98) ([af48dec](https://github.com/forkline/robotlb/commit/af48dec75c6e051235f98420b58d9dd0dba5de86))
+- deps: Update pre-commit hook alessandrojcm/commitlint-pre-commit-hook to v9.27.0 (#99) ([d0d767a](https://github.com/forkline/robotlb/commit/d0d767aee54401b2974b989da287b7b4b7f8e039))
+- deps: Update actions-rust-lang/setup-rust-toolchain action to v2 (#105) ([75f5338](https://github.com/forkline/robotlb/commit/75f5338691a00a72c1ee5806ddf0dfe804b8cd6f))
+- deps: Update actions/setup-python action to v7 (#107) ([b60708e](https://github.com/forkline/robotlb/commit/b60708ed02a1939fd72c1bbc00aa9d61f708f309))
+- deps: Update Rust crate hcloud to 0.26.0 (#100) ([610b30f](https://github.com/forkline/robotlb/commit/610b30f9a99ec2c1136ba22368d4c242301ba74c))
+- deps: Update Rust crate kube to v4 (#108) ([3572ba5](https://github.com/forkline/robotlb/commit/3572ba57dc9db520dc1ff91a6de9376e148effb0))
+- deps: Update rust Docker tag to v1.99.1 (#111) ([4ab2f86](https://github.com/forkline/robotlb/commit/4ab2f8642f7a680dd32b0cdf1176af044a5e1e90))
+- deps: Update docker/setup-buildx-action action to v4 (#113) ([a2df046](https://github.com/forkline/robotlb/commit/a2df04699a47dca7c3db548dc27f3fa40ab1b9d0))
+
 ## [0.7.4](https://github.com/forkline/robotlb/tree/0.7.4) - 2026-10-14
 
 ### Fixed
