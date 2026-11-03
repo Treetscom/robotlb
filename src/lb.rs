@@ -23,6 +23,7 @@ use std::{collections::HashMap, str::FromStr};
 use crate::{
     consts,
     error::{RobotLBError, RobotLBResult},
+    ip_type::IPMode,
     CurrentContext,
 };
 
@@ -60,6 +61,7 @@ pub struct LoadBalancer {
     pub balancer_type: String,
     pub algorithm: LoadBalancerAlgorithm,
     pub network_name: Option<String>,
+    pub ip_type: IPMode,
 
     pub hcloud_config: HcloudConfig,
 }
@@ -135,12 +137,20 @@ impl LoadBalancer {
             .annotations()
             .get(consts::LB_NAME_LABEL_NAME)
             .cloned()
-            .unwrap_or(svc.name_any());
+            .unwrap_or_else(|| svc.name_any());
 
         let private_ip = svc
             .annotations()
             .get(consts::LB_PRIVATE_IP_LABEL_NAME)
             .cloned();
+
+        let ip_type = svc
+            .annotations()
+            .get(consts::LB_IP_TYPE_LABEL_NAME)
+            .map(String::as_str)
+            .map(IPMode::from_str)
+            .transpose()?
+            .unwrap_or(context.config.default_ip_mode);
 
         Ok(Self {
             name,
@@ -152,6 +162,7 @@ impl LoadBalancer {
             location,
             proxy_mode,
             network_name,
+            ip_type,
             algorithm: algorithm.into(),
             services: HashMap::default(),
             targets: Vec::default(),
@@ -424,7 +435,7 @@ impl LoadBalancer {
         &self,
         hcloud_balancer: &hcloud::models::LoadBalancer,
     ) -> RobotLBResult<()> {
-        if *hcloud_balancer.algorithm == self.algorithm.clone().into() {
+        if *hcloud_balancer.algorithm == self.algorithm.clone() {
             return Ok(());
         }
         tracing::info!(
@@ -437,7 +448,7 @@ impl LoadBalancer {
                 &self.hcloud_config,
                 ChangeAlgorithmParams {
                     id: hcloud_balancer.id,
-                    body: Some(self.algorithm.clone().into()),
+                    body: Some(self.algorithm.clone()),
                 },
             )
         })
@@ -613,7 +624,7 @@ impl LoadBalancer {
         let hcloud_balancers = hcloud::apis::load_balancers_api::list_load_balancers(
             &self.hcloud_config,
             ListLoadBalancersParams {
-                name: Some(self.name.to_string()),
+                name: Some(self.name.clone()),
                 ..Default::default()
             },
         )
@@ -688,15 +699,13 @@ impl LoadBalancer {
                 network_name
             );
             return Err(RobotLBError::HCloudError(format!(
-                "Found more than one network with name {}",
-                network_name,
+                "Found more than one network with name {network_name}",
             )));
         }
         if response.networks.is_empty() {
             tracing::warn!("Network with name {} not found", network_name);
             return Err(RobotLBError::HCloudError(format!(
-                "Network with name {} not found",
-                network_name,
+                "Network with name {network_name} not found",
             )));
         }
 
@@ -872,5 +881,76 @@ mod tests {
     fn a_plan_within_the_limit_keeps_every_target() {
         let desired = vec!["192.168.100.2".to_string(), "192.168.100.3".to_string()];
         assert_eq!(plan_targets(&desired, 25).len(), 2);
+    }
+
+    use super::LoadBalancer;
+    use crate::{
+        config::OperatorConfig, consts, error::RobotLBError, ip_type::IPMode, CurrentContext,
+    };
+    use clap::Parser;
+    use k8s_openapi::{api::core::v1::Service, apimachinery::pkg::apis::meta::v1::ObjectMeta};
+    use std::collections::BTreeMap;
+
+    fn context_with_ip_mode(default_ip_mode: IPMode) -> CurrentContext {
+        let mut config =
+            OperatorConfig::try_parse_from(["robotlb", "--hcloud-token", "t"]).unwrap();
+        config.default_ip_mode = default_ip_mode;
+        // No cluster is needed: the client is only built, never used.
+        let client =
+            kube::Client::try_from(kube::Config::new("https://127.0.0.1:6443".parse().unwrap()))
+                .unwrap();
+        let mut hcloud_config = super::HcloudConfig::new();
+        hcloud_config.bearer_access_token = Some("t".to_string());
+        CurrentContext::new(client, config, hcloud_config)
+    }
+
+    fn service_with_ip_type(ip_type: Option<&str>) -> Service {
+        let mut annotations = BTreeMap::new();
+        if let Some(ip_type) = ip_type {
+            annotations.insert(
+                consts::LB_IP_TYPE_LABEL_NAME.to_string(),
+                ip_type.to_string(),
+            );
+        }
+        Service {
+            metadata: ObjectMeta {
+                name: Some("web".to_string()),
+                annotations: Some(annotations),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn is_proxy(mode: IPMode) -> bool {
+        matches!(mode, IPMode::Proxy)
+    }
+
+    #[tokio::test]
+    async fn a_missing_ip_type_annotation_falls_back_to_the_default() {
+        let svc = service_with_ip_type(None);
+        let lb = LoadBalancer::try_from_svc(&svc, &context_with_ip_mode(IPMode::VIP)).unwrap();
+        assert!(!is_proxy(lb.ip_type));
+        let lb = LoadBalancer::try_from_svc(&svc, &context_with_ip_mode(IPMode::Proxy)).unwrap();
+        assert!(is_proxy(lb.ip_type));
+    }
+
+    #[tokio::test]
+    async fn an_ip_type_annotation_overrides_the_default() {
+        let svc = service_with_ip_type(Some("Proxy"));
+        let lb = LoadBalancer::try_from_svc(&svc, &context_with_ip_mode(IPMode::VIP)).unwrap();
+        assert!(is_proxy(lb.ip_type));
+        let svc = service_with_ip_type(Some("VIP"));
+        let lb = LoadBalancer::try_from_svc(&svc, &context_with_ip_mode(IPMode::Proxy)).unwrap();
+        assert!(!is_proxy(lb.ip_type));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_ip_type_annotation_is_rejected() {
+        let svc = service_with_ip_type(Some("vip"));
+        assert!(matches!(
+            LoadBalancer::try_from_svc(&svc, &context_with_ip_mode(IPMode::VIP)),
+            Err(RobotLBError::UnknownIPType)
+        ));
     }
 }

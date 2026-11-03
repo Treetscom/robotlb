@@ -85,6 +85,8 @@ pub enum RobotLBError {
     HcloudListLoadBalancersError(
         #[from] hcloud::apis::Error<hcloud::apis::load_balancers_api::ListLoadBalancersError>,
     ),
+    #[error("Unknown IP Type. Only VIP or Proxy are allowed.")]
+    UnknownIPType,
 }
 
 impl RobotLBError {
@@ -115,6 +117,7 @@ impl RobotLBError {
             | Self::HCloudError(_)
             | Self::KubeError(_)
             | Self::UnknownLBAlgorithm
+            | Self::UnknownIPType
             | Self::ServiceWithoutSelector
             | Self::RateLimited(_) => false,
         }
@@ -280,6 +283,21 @@ mod tests {
     fn other_statuses_are_not_a_rate_limit() {
         assert!(!RobotLBError::from(response_error(500, "")).is_rate_limited());
         assert!(!RobotLBError::SkipService.is_rate_limited());
+    }
+
+    // A misconfigured annotation is the user's problem, not Hetzner's, so it
+    // must not close the rate limit gate.
+    #[test]
+    fn an_unknown_ip_type_is_not_a_rate_limit() {
+        assert!(!RobotLBError::UnknownIPType.is_rate_limited());
+    }
+
+    #[test]
+    fn the_unknown_ip_type_error_names_the_allowed_values() {
+        assert_eq!(
+            RobotLBError::UnknownIPType.to_string(),
+            "Unknown IP Type. Only VIP or Proxy are allowed."
+        );
     }
 
     #[test]

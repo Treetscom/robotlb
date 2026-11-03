@@ -12,6 +12,7 @@ pub const LB_PRIVATE_IP_LABEL_NAME: &str = "robotlb/lb-private-ip";
 pub const LB_LOCATION_LABEL_NAME: &str = "robotlb/lb-location";
 pub const LB_ALGORITHM_LABEL_NAME: &str = "robotlb/lb-algorithm";
 pub const LB_BALANCER_TYPE_LABEL_NAME: &str = "robotlb/balancer-type";
+pub const LB_IP_TYPE_LABEL_NAME: &str = "robotlb/ip-type";
 
 pub const DEFAULT_LB_RETRIES: i32 = 3;
 pub const DEFAULT_LB_TIMEOUT: i32 = 10;
