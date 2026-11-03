@@ -600,10 +600,10 @@ pub async fn reconcile_load_balancer(
 
     let mut ingress = vec![];
 
-    let dns_ipv4 = hcloud_lb.public_net.ipv4.dns_ptr.flatten();
-    let ipv4 = hcloud_lb.public_net.ipv4.ip.flatten();
-    let dns_ipv6 = hcloud_lb.public_net.ipv6.dns_ptr.flatten();
-    let ipv6 = hcloud_lb.public_net.ipv6.ip.flatten();
+    let dns_ipv4 = hcloud_lb.public_net.ipv4.dns_ptr;
+    let ipv4 = hcloud_lb.public_net.ipv4.ip;
+    let dns_ipv6 = hcloud_lb.public_net.ipv6.dns_ptr;
+    let ipv6 = hcloud_lb.public_net.ipv6.ip;
     if let Some(ipv4) = &ipv4 {
         ingress.push(json!({
             "ip": ipv4,
