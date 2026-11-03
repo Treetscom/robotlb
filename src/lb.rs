@@ -10,10 +10,10 @@ use hcloud::{
         networks_api::ListNetworksParams,
     },
     models::{
-        AttachLoadBalancerToNetworkRequest, ChangeTypeOfLoadBalancerRequest, DeleteServiceRequest,
-        DetachLoadBalancerFromNetworkRequest, LoadBalancerAddTarget, LoadBalancerAlgorithm,
-        LoadBalancerService, LoadBalancerServiceHealthCheck, RemoveTargetRequest,
-        UpdateLoadBalancerService,
+        AddServiceRequest, AttachLoadBalancerToNetworkRequest, ChangeTypeOfLoadBalancerRequest,
+        DeleteServiceRequest, DetachLoadBalancerFromNetworkRequest, LoadBalancerAddTarget,
+        LoadBalancerAlgorithm, LoadBalancerService, LoadBalancerServiceHealthCheck,
+        LoadBalancerServiceTcp, LoadBalancerTarget, RemoveTargetRequest, UpdateLoadBalancerService,
     },
 };
 use k8s_openapi::api::core::v1::Service;
@@ -206,15 +206,23 @@ impl LoadBalancer {
         hcloud_balancer: &hcloud::models::LoadBalancer,
     ) -> RobotLBResult<()> {
         for service in &hcloud_balancer.services {
+            let listen_port = service_listen_port(service);
             // Here we check that all the services are configured correctly.
             // If the service is not configured correctly, we update it.
-            if let Some(destination_port) = self.services.get(&service.listen_port) {
-                if self.service_is_current(service, *destination_port) {
+            if let Some(destination_port) = self.services.get(&listen_port) {
+                // The desired configuration is always TCP, so an HTTP(S) service on the
+                // same port is out of date too and gets rewritten.
+                let is_current = matches!(
+                    service,
+                    LoadBalancerService::LoadBalancerServiceTcp(current)
+                        if self.service_is_current(current, *destination_port)
+                );
+                if is_current {
                     continue;
                 }
                 tracing::info!(
                     "Desired service configuration for port {} does not match current configuration. Updating ...",
-                    service.listen_port,
+                    listen_port,
                 );
                 retry_temporary(BUSY_RETRIES, BUSY_RETRY_UNIT, || {
                     hcloud::apis::load_balancers_api::update_service(
@@ -224,19 +232,18 @@ impl LoadBalancer {
                             update_load_balancer_service: UpdateLoadBalancerService {
                                 http: None,
                                 protocol: Some(hcloud::models::update_load_balancer_service::Protocol::Tcp),
-                                listen_port: service.listen_port,
+                                listen_port,
                                 destination_port: Some(*destination_port),
                                 proxyprotocol: Some(self.proxy_mode),
-                                health_check: Some(Box::new(
-                                    hcloud::models::UpdateLoadBalancerServiceHealthCheck {
-                                        protocol: Some(hcloud::models::update_load_balancer_service_health_check::Protocol::Tcp),
-                                        http: None,
-                                        interval: Some(self.check_interval),
-                                        port: Some(*destination_port),
-                                        retries: Some(self.retries),
-                                        timeout: Some(self.timeout),
-                                    },
-                                )),
+                                health_check: Some(Box::new(LoadBalancerServiceHealthCheck {
+                                    protocol:
+                                        hcloud::models::load_balancer_service_health_check::Protocol::Tcp,
+                                    http: None,
+                                    interval: self.check_interval,
+                                    port: *destination_port,
+                                    retries: self.retries,
+                                    timeout: self.timeout,
+                                })),
                             },
                         },
                     )
@@ -245,7 +252,7 @@ impl LoadBalancer {
             } else {
                 tracing::info!(
                     "Deleting service that listens for port {} from load-balancer {}",
-                    service.listen_port,
+                    listen_port,
                     hcloud_balancer.name,
                 );
                 retry_temporary(BUSY_RETRIES, BUSY_RETRY_UNIT, || {
@@ -253,9 +260,7 @@ impl LoadBalancer {
                         &self.hcloud_config,
                         DeleteServiceParams {
                             id: hcloud_balancer.id,
-                            delete_service_request: DeleteServiceRequest {
-                                listen_port: service.listen_port,
-                            },
+                            delete_service_request: DeleteServiceRequest { listen_port },
                         },
                     )
                 })
@@ -267,7 +272,7 @@ impl LoadBalancer {
             if !hcloud_balancer
                 .services
                 .iter()
-                .any(|s| s.listen_port == *listen_port)
+                .any(|s| service_listen_port(s) == *listen_port)
             {
                 tracing::info!(
                     "Found missing service. Adding service that listens for port {}",
@@ -278,11 +283,11 @@ impl LoadBalancer {
                         &self.hcloud_config,
                         AddServiceParams {
                             id: hcloud_balancer.id,
-                            load_balancer_service: LoadBalancerService {
+                            add_service_request: AddServiceRequest {
                                 http: None,
                                 listen_port: *listen_port,
                                 destination_port: *destination_port,
-                                protocol: hcloud::models::load_balancer_service::Protocol::Tcp,
+                                protocol: hcloud::models::add_service_request::Protocol::Tcp,
                                 proxyprotocol: self.proxy_mode,
                                 health_check: Box::new(LoadBalancerServiceHealthCheck {
                                     http: None,
@@ -303,14 +308,13 @@ impl LoadBalancer {
         Ok(())
     }
 
-    fn service_is_current(&self, service: &LoadBalancerService, destination_port: i32) -> bool {
+    fn service_is_current(&self, service: &LoadBalancerServiceTcp, destination_port: i32) -> bool {
         service.destination_port == destination_port
             && service.health_check.port == destination_port
             && service.health_check.interval == self.check_interval
             && service.health_check.retries == self.retries
             && service.health_check.timeout == self.timeout
             && service.proxyprotocol == self.proxy_mode
-            && service.http.is_none()
             && service.health_check.protocol
                 == hcloud::models::load_balancer_service_health_check::Protocol::Tcp
     }
@@ -341,18 +345,18 @@ impl LoadBalancer {
         }
 
         for target in &hcloud_balancer.targets {
-            let Some(target_ip) = target.ip.clone() else {
+            let LoadBalancerTarget::LoadBalancerTargetTypeIp(target) = target else {
                 continue;
             };
-            if !planned.contains(&target_ip.ip.as_str()) {
-                tracing::info!("Removing target {}", target_ip.ip);
+            if !planned.contains(&target.ip.ip.as_str()) {
+                tracing::info!("Removing target {}", target.ip.ip);
                 retry_temporary(BUSY_RETRIES, BUSY_RETRY_UNIT, || {
                     hcloud::apis::load_balancers_api::remove_target(
                         &self.hcloud_config,
                         RemoveTargetParams {
                             id: hcloud_balancer.id,
                             remove_target_request: RemoveTargetRequest {
-                                ip: Some(target_ip.clone()),
+                                ip: Some(target.ip.clone()),
                                 ..Default::default()
                             },
                         },
@@ -369,7 +373,7 @@ impl LoadBalancer {
             if hcloud_balancer
                 .targets
                 .iter()
-                .any(|t| t.ip.as_ref().map(|i| i.ip.as_str()) == Some(*ip))
+                .any(|t| target_ip(t) == Some(*ip))
             {
                 live += 1;
                 continue;
@@ -447,7 +451,7 @@ impl LoadBalancer {
                 &self.hcloud_config,
                 ChangeAlgorithmParams {
                     id: hcloud_balancer.id,
-                    body: self.algorithm.clone(),
+                    load_balancer_algorithm: self.algorithm.clone(),
                 },
             )
         })
@@ -504,15 +508,13 @@ impl LoadBalancer {
         let mut contain_desired_network = false;
         if !hcloud_balancer.private_net.is_empty() {
             for private_net in &hcloud_balancer.private_net {
-                let Some(private_net_id) = private_net.network else {
-                    continue;
-                };
+                let private_net_id = private_net.network;
                 // The load balancer is attached to a target network.
                 if desired_network == Some(private_net_id) {
                     // Specific IP was provided, we need to check if the IP is the same.
                     if self.private_ip.is_some() {
                         // if IPs match, we can leave everything as it is.
-                        if private_net.ip == self.private_ip {
+                        if self.private_ip.as_deref() == Some(private_net.ip.as_str()) {
                             contain_desired_network = true;
                             continue;
                         }
@@ -570,31 +572,30 @@ impl LoadBalancer {
             return Ok(());
         };
         for service in &hcloud_balancer.services {
+            let listen_port = service_listen_port(service);
             tracing::info!(
                 "Deleting service that listens for port {} from load-balancer {}",
-                service.listen_port,
+                listen_port,
                 hcloud_balancer.name,
             );
             hcloud::apis::load_balancers_api::delete_service(
                 &self.hcloud_config,
                 DeleteServiceParams {
                     id: hcloud_balancer.id,
-                    delete_service_request: DeleteServiceRequest {
-                        listen_port: service.listen_port,
-                    },
+                    delete_service_request: DeleteServiceRequest { listen_port },
                 },
             )
             .await?;
         }
         for target in &hcloud_balancer.targets {
-            if let Some(target_ip) = target.ip.clone() {
-                tracing::info!("Removing target {}", target_ip.ip);
+            if let LoadBalancerTarget::LoadBalancerTargetTypeIp(target) = target {
+                tracing::info!("Removing target {}", target.ip.ip);
                 hcloud::apis::load_balancers_api::remove_target(
                     &self.hcloud_config,
                     RemoveTargetParams {
                         id: hcloud_balancer.id,
                         remove_target_request: RemoveTargetRequest {
-                            ip: Some(target_ip),
+                            ip: Some(target.ip.clone()),
                             ..Default::default()
                         },
                     },
@@ -708,6 +709,23 @@ impl LoadBalancer {
         }
 
         Ok(response.networks.into_iter().next())
+    }
+}
+
+/// The port a service listens on, regardless of which protocol variant it is.
+fn service_listen_port(service: &LoadBalancerService) -> i32 {
+    match service {
+        LoadBalancerService::LoadBalancerServiceTcp(service) => service.listen_port,
+        LoadBalancerService::LoadBalancerServiceHttpProtocol(service) => service.listen_port,
+        LoadBalancerService::LoadBalancerServiceHttpsProtocol(service) => service.listen_port,
+    }
+}
+
+/// The IP of a target, if it is an IP target at all.
+fn target_ip(target: &LoadBalancerTarget) -> Option<&str> {
+    match target {
+        LoadBalancerTarget::LoadBalancerTargetTypeIp(target) => Some(target.ip.ip.as_str()),
+        _ => None,
     }
 }
 
