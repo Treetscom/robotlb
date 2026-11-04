@@ -68,33 +68,88 @@ Usage: robotlb [OPTIONS] --hcloud-token <HCLOUD_TOKEN>
 
 Options:
   -t, --hcloud-token <HCLOUD_TOKEN>
-          `HCloud` API token [env: ROBOTLB_HCLOUD_TOKEN=]
+          `HCloud` API token
+
+          [env: ROBOTLB_HCLOUD_TOKEN=]
+
       --default-network <DEFAULT_NETWORK>
-          Default network to use for load balancers. If not set, then only network from the service annotation will be used [env: ROBOTLB_DEFAULT_NETWORK=]
+          Default network to use for load balancers. If not set, then only network from the service annotation will be used
+
+          [env: ROBOTLB_DEFAULT_NETWORK=]
+
       --dynamic-node-selector
-          If enabled, the operator will try to find target nodes based on the service's traffic policy, and under `Local` on the nodes serving the service's endpoints. If disabled, the operator will try to find target nodes based on the node selector [env: ROBOTLB_DYNAMIC_NODE_SELECTOR=]
+          If enabled, the operator will try to find target nodes based on the service's traffic policy, and under `Local` on the nodes serving the service's endpoints. I
+f disabled, the operator will try to find target nodes based on the node selector
+
+          [env: ROBOTLB_DYNAMIC_NODE_SELECTOR=]
+
       --default-lb-retries <DEFAULT_LB_RETRIES>
-          Default load balancer healthcheck retries cound [env: ROBOTLB_DEFAULT_LB_RETRIES=] [default: 3]
+          Default load balancer healthcheck retries cound
+
+          [env: ROBOTLB_DEFAULT_LB_RETRIES=]
+          [default: 3]
+
       --default-lb-timeout <DEFAULT_LB_TIMEOUT>
-          Default load balancer healthcheck timeout [env: ROBOTLB_DEFAULT_LB_TIMEOUT=] [default: 10]
+          Default load balancer healthcheck timeout
+
+          [env: ROBOTLB_DEFAULT_LB_TIMEOUT=]
+          [default: 10]
+
       --default-lb-interval <DEFAULT_LB_INTERVAL>
-          Default load balancer healhcheck interval [env: ROBOTLB_DEFAULT_LB_INTERVAL=] [default: 15]
+          Default load balancer healhcheck interval
+
+          [env: ROBOTLB_DEFAULT_LB_INTERVAL=]
+          [default: 15]
+
       --default-lb-location <DEFAULT_LB_LOCATION>
-          Default location of a load balancer. https://docs.hetzner.com/cloud/general/locations/ [env: ROBOTLB_DEFAULT_LB_LOCATION=] [default: hel1]
+          Default location of a load balancer. <https://docs.hetzner.com/cloud/general/locations>/
+
+          [env: ROBOTLB_DEFAULT_LB_LOCATION=]
+          [default: hel1]
+
       --default-balancer-type <DEFAULT_BALANCER_TYPE>
-          Type of a load balancer. It differs in price, number of connections, target servers, etc. The default value is the smallest balancer. https://docs.hetzner.com/cloud/load-balancers/overview#pricing [env: ROBOTLB_DEFAULT_LB_TYPE=] [default: lb11]
+          Type of a load balancer. It differs in price, number of connections, target servers, etc. The default value is the smallest balancer. <https://docs.hetzner.com
+/cloud/load-balancers/overview#pricing>
+
+          [env: ROBOTLB_DEFAULT_LB_TYPE=]
+          [default: lb11]
+
       --default-lb-algorithm <DEFAULT_LB_ALGORITHM>
-          Default load balancer algorithm. Possible values: * `least-connections` * `round-robin` https://docs.hetzner.com/cloud/load-balancers/overview#load-balancers [env: ROBOTLB_DEFAULT_LB_ALGORITHM=] [default: least-connections]
+          Default load balancer algorithm. Possible values: * `least-connections` * `round-robin`
+
+          <https://docs.hetzner.com/cloud/load-balancers/overview#load-balancers>
+
+          [env: ROBOTLB_DEFAULT_LB_ALGORITHM=]
+          [default: least-connections]
+
       --default-lb-proxy-mode-enabled
-          Default load balancer proxy mode. If enabled, the load balancer will act as a proxy for the target servers. The default value is `false`. https://docs.hetzner.com/cloud/load-balancers/faq/#what-does-proxy-protocol-mean-and-should-i-enable-it [env: ROBOTLB_DEFAULT_LB_PROXY_MODE_ENABLED=]
+          Default load balancer proxy mode. If enabled, the load balancer will act as a proxy for the target servers. The default value is `false`. <https://docs.hetzner
+.com/cloud/load-balancers/faq/#what-does-proxy-protocol-mean-and-should-i-enable-it>
+
+          [env: ROBOTLB_DEFAULT_LB_PROXY_MODE_ENABLED=]
+
+      --default-ip-mode <DEFAULT_IP_MODE>
+          [env: ROBOTLB_DEFAULT_IP_MODE=]
+          [default: VIP]
+
       --ipv6-ingress
-          Whether to enable IPv6 ingress for the load balancer. If enabled, the load balancer's IPv6 will be attached to the service as an external IP along with IPv4 [env: ROBOTLB_IPV6_INGRESS=]
+          Whether to enable IPv6 ingress for the load balancer. If enabled, the load balancer's IPv6 will be attached to the service as an external IP along with IPv4
+
+          [env: ROBOTLB_IPV6_INGRESS=]
+
       --resync-interval <RESYNC_INTERVAL>
-          Seconds between reconciliations of a service that nothing changed. Node changes, and endpoint changes of Local services, trigger a reconciliation on their own; this interval bounds how long a change made to a balancer outside robotlb survives. A service whose balancer refused a target is retried within 30 seconds [env: ROBOTLB_RESYNC_INTERVAL=] [default: 300]
+          Seconds between reconciliations of a service that nothing changed. Node changes, and endpoint changes of Local services, trigger a reconciliation on their own;
+ this interval bounds how long a change made to a balancer outside robotlb survives. A service whose balancer refused a target is retried within 30 seconds
+
+          [env: ROBOTLB_RESYNC_INTERVAL=]
+          [default: 300]
+
       --log-level <LOG_LEVEL>
-          [env: ROBOTLB_LOG_LEVEL=] [default: INFO]
+          [env: ROBOTLB_LOG_LEVEL=]
+          [default: INFO]
+
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
 ```
 
 
@@ -144,6 +199,9 @@ metadata:
     robotlb/lb-algorithm: "least-connection"
     # Type of balancer.
     robotlb/balancer-type: "lb11"
+    # Type of an IP when added to the status.
+    # Can be iether VIP or Proxy.
+    robotlb/ip-mode: "VIP"
 spec:
   type: LoadBalancer
   # The selector fills the service's endpoints; with

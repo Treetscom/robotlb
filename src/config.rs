@@ -1,4 +1,4 @@
-use crate::ip_type::IPMode;
+use crate::ip_mode::IPMode;
 use clap::Parser;
 use tracing::level_filters::LevelFilter;
 
@@ -92,7 +92,7 @@ pub struct OperatorConfig {
 #[cfg(test)]
 mod tests {
     use super::OperatorConfig;
-    use crate::ip_type::IPMode;
+    use crate::ip_mode::IPMode;
     use clap::Parser;
 
     fn parse(resync: &str) -> Result<OperatorConfig, clap::Error> {

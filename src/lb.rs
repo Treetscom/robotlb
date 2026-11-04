@@ -23,7 +23,7 @@ use std::{collections::HashMap, str::FromStr};
 use crate::{
     CurrentContext, consts,
     error::{RobotLBError, RobotLBResult},
-    ip_type::IPMode,
+    ip_mode::IPMode,
 };
 
 /// Retries after the first attempt, sleeping 1 unit, 2 units, ... between them.
@@ -145,7 +145,7 @@ impl LoadBalancer {
 
         let ip_type = svc
             .annotations()
-            .get(consts::LB_IP_TYPE_LABEL_NAME)
+            .get(consts::LB_IP_MODE_LABEL_NAME)
             .map(String::as_str)
             .map(IPMode::from_str)
             .transpose()?
@@ -901,7 +901,7 @@ mod tests {
 
     use super::LoadBalancer;
     use crate::{
-        CurrentContext, config::OperatorConfig, consts, error::RobotLBError, ip_type::IPMode,
+        CurrentContext, config::OperatorConfig, consts, error::RobotLBError, ip_mode::IPMode,
     };
     use clap::Parser;
     use k8s_openapi::{api::core::v1::Service, apimachinery::pkg::apis::meta::v1::ObjectMeta};
@@ -924,7 +924,7 @@ mod tests {
         let mut annotations = BTreeMap::new();
         if let Some(ip_type) = ip_type {
             annotations.insert(
-                consts::LB_IP_TYPE_LABEL_NAME.to_string(),
+                consts::LB_IP_MODE_LABEL_NAME.to_string(),
                 ip_type.to_string(),
             );
         }

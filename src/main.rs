@@ -54,7 +54,7 @@ pub mod config;
 pub mod consts;
 pub mod error;
 pub mod finalizers;
-pub mod ip_type;
+pub mod ip_mode;
 pub mod label_filter;
 pub mod lb;
 pub mod rate_limit;
