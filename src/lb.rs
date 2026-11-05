@@ -664,6 +664,7 @@ impl LoadBalancer {
                     network: None,
                     network_zone: None,
                     public_interface: Some(true),
+                    public_net: None,
                     services: Some(vec![]),
                     targets: Some(vec![]),
                 },
