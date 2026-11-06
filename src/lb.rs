@@ -564,45 +564,11 @@ impl LoadBalancer {
         Ok(())
     }
 
-    /// Cleanup the load balancer.
-    /// This method will remove all the services and targets from the
-    /// load balancer.
+    /// Delete the balancer of the service, found by its name.
     pub async fn cleanup(&self) -> RobotLBResult<()> {
         let Some(hcloud_balancer) = self.get_hcloud_lb().await? else {
             return Ok(());
         };
-        for service in &hcloud_balancer.services {
-            let listen_port = service_listen_port(service);
-            tracing::info!(
-                "Deleting service that listens for port {} from load-balancer {}",
-                listen_port,
-                hcloud_balancer.name,
-            );
-            hcloud::apis::load_balancers_api::delete_service(
-                &self.hcloud_config,
-                DeleteServiceParams {
-                    id: hcloud_balancer.id,
-                    delete_service_request: DeleteServiceRequest { listen_port },
-                },
-            )
-            .await?;
-        }
-        for target in &hcloud_balancer.targets {
-            if let LoadBalancerTarget::LoadBalancerTargetTypeIp(target) = target {
-                tracing::info!("Removing target {}", target.ip.ip);
-                hcloud::apis::load_balancers_api::remove_target(
-                    &self.hcloud_config,
-                    RemoveTargetParams {
-                        id: hcloud_balancer.id,
-                        remove_target_request: RemoveTargetRequest {
-                            ip: Some(target.ip.clone()),
-                            ..Default::default()
-                        },
-                    },
-                )
-                .await?;
-            }
-        }
         hcloud::apis::load_balancers_api::delete_load_balancer(
             &self.hcloud_config,
             DeleteLoadBalancerParams {
