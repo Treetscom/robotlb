@@ -3,10 +3,11 @@ use std::str::FromStr;
 use crate::error::RobotLBError;
 
 /// IP Type set by the loadbancer in the status field.
-#[derive(Clone, Debug, Copy, serde::Serialize)]
+#[derive(Clone, Debug, Default, Copy, serde::Serialize)]
 pub enum IPMode {
     /// Type of an IP when the traffic is routed
     /// with the loadbalancer IP and port.
+    #[default]
     VIP,
     /// Type of an IP when the traffic is routed
     /// with the node IP.
