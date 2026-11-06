@@ -657,6 +657,7 @@ impl LoadBalancer {
             hcloud::apis::load_balancers_api::CreateLoadBalancerParams {
                 create_load_balancer_request: hcloud::models::CreateLoadBalancerRequest {
                     algorithm: Some(Box::new(self.algorithm.clone())),
+                    public_net: None,
                     labels: None,
                     load_balancer_type: self.balancer_type.clone(),
                     location: Some(self.location.clone()),
