@@ -1,0 +1,23 @@
+# markdownlint-cli2 configuration
+
+ignores:
+  - target/**
+
+# Rule configuration
+config:
+  # Disable line length rule - technical documentation often needs longer lines
+  MD013: false
+  # Allow both duplicate headings - common in docs with multiple sections
+  MD024: false
+  # Allow ordered lists with any prefix style (1. 2. 3. or all 1.)
+  MD029: false
+  # Allow any spacing after list markers - MkDocs compatibility
+  MD030: false
+  # Allow inline HTML for badges, special formatting
+  MD033: false
+  # Allow bare URLs - common in technical docs
+  MD034: false
+  # Allow both fenced and indented code blocks
+  MD046: false
+  # Disable table column style rule - compact style is fine
+  MD060: false

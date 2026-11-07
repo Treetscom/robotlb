@@ -6,6 +6,7 @@ On each server, I will be using the latest Ubuntu LTS release which is `24.04`.
 We start with deploying control-plane nodes. Those nodes won't be serving any workloads,
 but only responsible for managing internal Kubernetes jobs.
 
+## Cloud side
 
 ### Cloud servers
 
@@ -15,7 +16,6 @@ Let's start by ordering 5 servers. 3 servers will be used as control planes, 1 a
 You can buy 5 CAX11s which should be sufficient for small and medium-sized clusters and will cost you about 16 EUR.
 
 ### Setup users
-
 
 As an additional layer of security, you can create a user called k3s on all servers which will be parts of the cluster.
 
@@ -39,8 +39,7 @@ After the installation is complete, remove the k3s from sudoers.
 sed -i '/^k3s ALL.*/d' /etc/sudoers
 ```
 
-
-### Network.
+### Network
 
 Once servers have been purchased, let's create a private network. To do so, go to a network tab and create a new network in the same zone as your servers with the subnet `10.10.0.0/16`. This subnet can be anything you want, but if you want to go with any other subnet, please make sure that it doesn't overlap with `--cluster-cidr` (used to give IPs to pods) or `--service-cidr` (used to provide IPs for services). For k3s these values can be found here: https://docs.k3s.io/cli/server#networking.
 
@@ -87,7 +86,6 @@ $ ip addr
 
 As you can see, the address `10.10.1.2/32` is assigned to the interface `enp7s0`.
 Now let's create a config that will suit our needs. First, we need public and private keys for the server. Run it on the server.
-
 
 ```bash
 wg genkey | tee privatekey | wg pubkey > publickey
@@ -237,7 +235,6 @@ Important things to note here:
 * TLS san should include load-balancer IP, otherwise your cert will be rejected.
 * Make sure to use the correct flannel interface for inter-node communication.
 
-
 ```bash
 #!/bin/bash
 # SSH user to use during the installation. You can go with root if you skipped creating a user.
@@ -303,7 +300,6 @@ join_server "10.10.1.2" "10.10.1.3"
 
 After running this script you should see that control planes became healthy on our load-balancer at `http://10.10.1.4`. Also, in your generated kubeconfig file change the address of the server to the load-balancer's address. So it will become:
 
-
 ```yaml
 ...
     server: https://10.10.1.4:6443
@@ -325,16 +321,14 @@ To further debug and diagnose cluster problems, use 'kubectl cluster-info dump'.
 
 You should see that all IPs are pointing to a load-balancer.
 
-# Robot side
+## Robot side
 
 Now let's create agent nodes on the Hetzner robot. I will buy 2 servers in the same region as our cloud servers.
 
 After they are ready, create a `vSwitch` and connect robot servers to the switch. But before setting up all the virtual interfaces,
 create a `vSwitch` type subnet in our cloud network.
 
-
 ### vSwitch backbone
-
 
 To do so, go to a cloud `network console` > `subnets` > `add subnet` and select a subnet range that you think will be sufficient for all your robot servers. Keep in mind that you can add only one `vSwitch` to a cloud network. I would go with `10.10.192.0/18`, because I want to also host dedicated servers for other purposes, like databases and other things.
 

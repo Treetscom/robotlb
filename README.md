@@ -53,7 +53,7 @@ robotlb labels every balancer it creates with `robotlb/service-uid` set to the U
 Every port of the service needs an allocated `nodePort`. A Hetzner load balancer forwards traffic to the IP of a node, so a port is reachable only through its `nodePort`: ports without one are skipped, and `allocateLoadBalancerNodePorts: false` is not supported. When no port of a service can be exposed, no balancer is created for it, an existing balancer and the service's external IP are kept as they are, and a warning event on the service reports the problem.
 
 > Earlier releases treated every service as if it had the `Local` policy. Services that leave `externalTrafficPolicy` unset therefore get the full node list on upgrade, which changes the targets of their existing balancers.
-
+>
 > Earlier releases created balancers without a label and named them after the service without its namespace. On the first reconcile after the upgrade, a service with no labelled balancer adopts the balancer under its old name, or under the name from its `robotlb/balancer` annotation, if every target of that balancer is an IP and at least one of them is a node of the service: robotlb adds its label and keeps the name. Otherwise the balancer is left alone: under the old name robotlb creates a new balancer with a new IP under `<service>.<namespace>`, under an annotated name the service gets a warning event instead. Services with the same name in different namespaces used to share one balancer: one of them keeps it, the others get a new balancer and a new IP. When they reconcile at the same moment, the others may configure the shared balancer and report its address once more before they get their own. A balancer without targets, for example because Hetzner refused every node, does not look like the service's. Under the old name it is replaced by a new balancer with a new IP and stays in the project, unlabelled and billed; under an annotated name the service gets a warning event. To hand an unlabelled balancer to a service yourself, label it: `hcloud load-balancer add-label '<balancer>' robotlb/service-uid=<service UID>`. While a service has no target nodes, for example a `Local` service without ready pods, robotlb cannot tell whether an unlabelled balancer is its own, so it waits and reports that in a warning event.
 >
 > A balancer is deleted only when it carries the label, so the balancer of a service deleted or changed from `LoadBalancer` before its first successful reconcile on this release stays in the project: a reconcile that stops early, for example because the service has no port to expose or no target nodes, adopts nothing. This includes services that earlier releases kept a balancer for after their type changed from `LoadBalancer` or they moved to another load balancer class: they still carry the `robotlb/finalizer` finalizer, robotlb removes it on the first start, and their balancers stay. List the balancers without the label, check which of them are still used, and delete the rest:
@@ -68,7 +68,6 @@ Every port of the service needs an allocated `nodePort`. A Hetzner load balancer
 > kubectl get services --all-namespaces --output json | jq --raw-output '.items[] | select(((.metadata.finalizers // []) | index("robotlb/finalizer")) and (.spec.type != "LoadBalancer" or (.spec.loadBalancerClass // "robotlb") != "robotlb")) | "\(.metadata.namespace)/\(.metadata.name)"'
 > ```
 
-
 ## Configuration
 
 This project has two places for configuration: environment variables and service annotations.
@@ -79,7 +78,7 @@ Environment variables are mainly used to override default arguments and provide 
 
 Here’s a complete list of parameters for the operator's binary:
 
-```
+```text
 Usage: robotlb [OPTIONS] --hcloud-token <HCLOUD_TOKEN>
 
 Options:
@@ -170,9 +169,7 @@ f disabled, the operator will try to find target nodes based on the node selecto
           Print help (see a summary with '-h')
 ```
 
-
 ### Service annotations
-
 
 ```yaml
 apiVersion: v1

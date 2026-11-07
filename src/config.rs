@@ -37,7 +37,7 @@ pub struct OperatorConfig {
     pub default_lb_interval: i32,
 
     /// Default location of a load balancer.
-    /// <https://docs.hetzner.com/cloud/general/locations>/
+    /// <https://docs.hetzner.com/cloud/general/locations/>
     #[arg(long, env = "ROBOTLB_DEFAULT_LB_LOCATION", default_value = "hel1")]
     pub default_lb_location: String,
 

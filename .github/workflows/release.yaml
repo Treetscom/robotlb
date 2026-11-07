@@ -4,55 +4,228 @@ on:
   release:
     types: [released]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
-  packages: write
 
+env:
+  IMAGE: ghcr.io/treetscom/robotlb
+  CHART_DIR: helm
+  CHART_NAME: robotlb
+  CHART_OCI_REPO: ghcr.io/treetscom/charts/robotlb
 
 jobs:
-  release_image:
-    runs-on: ubuntu-latest
+  build-and-push:
+    name: Build and Push (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # The binary reports the version from Cargo.toml, which stays 0.0.0 in git.
       - name: Update version
-        # Update a version in Cargo.toml before building the app.
         run: sed -i '0,/^version = .*/{s/version = .*/version = "${{ github.ref_name }}"/}' Cargo.toml
-      - name: Set up Docker
-        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v2
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
-            registry: ghcr.io
-            username: ${{ github.actor }}
-            password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push
-        uses: docker/build-push-action@v2
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ${{ env.IMAGE }}
+
+      - name: Build and Push by Digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64 # ,linux/arm64,linux/arm/v7  (uncomment once the fix for long builds is found).
-          push: true
-          tags: ghcr.io/treetscom/robotlb:latest,ghcr.io/treetscom/robotlb:${{ github.ref_name }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+          cache-to: type=gha,scope=build-${{ matrix.arch }},mode=max
+          labels: ${{ steps.meta.outputs.labels }}
 
-  upload_helm:
-    runs-on: ubuntu-latest
-    needs: [release_image]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: stable
-      - uses: azure/setup-helm@v4.2.0
-        with:
-          version: latest
-      - name: Build Helm chart
+      - name: Export digest
         run: |
-          helm package --app-version "${{ github.ref_name }}" --dependency-update ./helm
-          helm show chart *.tgz
-          helm registry login -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }} ghcr.io
-          helm push *.tgz oci://ghcr.io/treetscom/charts
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-manifests:
+    name: Merge Manifests
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: digests-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          mapfile -t tag_args < <(jq -r '.tags[] | "-t", .' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          images=()
+          for digest_file in *; do
+            [[ -f "$digest_file" ]] || continue
+            images+=("${IMAGE}@sha256:${digest_file}")
+          done
+          docker buildx imagetools create "${tag_args[@]}" "${images[@]}"
+
+      # Signing the digest covers every tag, so each tag is checked to point at it.
+      - name: Resolve manifest digest
+        id: digest
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect "${IMAGE}:${{ steps.meta.outputs.version }}" --format '{{.Manifest.Digest}}')"
+          [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::cannot resolve a manifest digest"; exit 1; }
+          while read -r tag; do
+            [[ -n "${tag}" ]] || continue
+            tag_digest="$(docker buildx imagetools inspect "${tag}" --format '{{.Manifest.Digest}}')"
+            if [[ "${tag_digest}" != "${digest}" ]]; then
+              echo "::error::${tag} resolves to ${tag_digest}, expected ${digest}"
+              exit 1
+            fi
+          done <<< "$DOCKER_METADATA_OUTPUT_TAGS"
+          echo "ref=${IMAGE}@${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign container image
         env:
-          HELM_EXPERIMENTAL_OCI: 1
+          IMAGE_REF: ${{ steps.digest.outputs.ref }}
+        run: cosign sign --yes "${IMAGE_REF}"
+
+      - name: Generate container summary
+        env:
+          IMAGE_REF: ${{ steps.digest.outputs.ref }}
+        run: |
+          {
+            echo "## Container Image"
+            echo ""
+            echo '```text'
+            echo "$DOCKER_METADATA_OUTPUT_TAGS"
+            echo '```'
+            echo ""
+            echo '```bash'
+            echo "cosign verify ${IMAGE_REF} --certificate-identity-regexp=https://github.com/${{ github.repository }} --certificate-oidc-issuer=https://token.actions.githubusercontent.com"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-chart:
+    name: Publish Helm Chart
+    runs-on: ubuntu-latest
+    needs: merge-manifests
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5
+        with:
+          version: 'v4.3.0'
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Package chart
+        run: |
+          helm package "${CHART_DIR}" \
+            --version "${{ github.ref_name }}" \
+            --app-version "${{ github.ref_name }}"
+
+      - name: Push and sign chart
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+          output="$(helm push "${CHART_NAME}-${{ github.ref_name }}.tgz" oci://ghcr.io/treetscom/charts 2>&1)"
+          echo "${output}"
+          digest="$(sed -n 's/^Digest: \(sha256:[0-9a-f]\{64\}\)$/\1/p' <<< "${output}")"
+          [[ -n "${digest}" ]] || { echo "::error::helm push reported no chart digest"; exit 1; }
+
+          cosign sign --yes "${CHART_OCI_REPO}@${digest}"
+
+          {
+            echo "## Helm Chart"
+            echo ""
+            echo '```bash'
+            echo "helm install robotlb oci://${CHART_OCI_REPO} --version ${{ github.ref_name }}"
+            echo "cosign verify ${CHART_OCI_REPO}@${digest} --certificate-identity-regexp=https://github.com/${{ github.repository }} --certificate-oidc-issuer=https://token.actions.githubusercontent.com"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attach chart to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.ref_name }}" "${CHART_NAME}-${{ github.ref_name }}.tgz"

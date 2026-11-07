@@ -1,0 +1,201 @@
+name: PR Privileged Actions
+
+# workflow_run always runs the default-branch copy of this file, so a fork's
+# PR cannot change what runs with these permissions.
+on:
+  workflow_run:
+    workflows: ["PR Checks and Build"]
+    types: [completed]
+
+permissions:
+  pull-requests: write
+  security-events: write
+  actions: read
+
+jobs:
+  upload-sarif:
+    name: Upload Security Results
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event.workflow_run.event == 'pull_request'
+    steps:
+      - name: Download PR metadata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: pr-metadata
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read and validate PR number
+        id: pr
+        run: |
+          PR_NUMBER=$(cat pr-number.txt)
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: Invalid PR number: $PR_NUMBER"
+            exit 1
+          fi
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      # pr-number.txt comes out of the pull_request run, which a fork's own
+      # copy of pr.yaml produces, so it can name any PR. Act on that PR only
+      # when it is the one this run built: same head commit, same head repo.
+      - name: Check the PR is the one this run built
+        id: match
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          RUN_HEAD: ${{ github.event.workflow_run.head_sha }} ${{ github.event.workflow_run.head_repository.full_name }}
+        run: |
+          set -euo pipefail
+          pr_head="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '"\(.head.sha) \(.head.repo.full_name)"')"
+          if [[ "${pr_head}" == "${RUN_HEAD}" ]]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::PR #${PR_NUMBER} is at '${pr_head}', this run built '${RUN_HEAD}'; skipping"
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download SARIF artifact
+        id: download-sarif
+        if: steps.match.outputs.current == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: trivy-sarif
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Upload SARIF to GitHub Security
+        if: steps.match.outputs.current == 'true' && steps.download-sarif.outcome == 'success'
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
+        with:
+          sarif_file: trivy-fs-results.sarif
+          category: trivy-filesystem
+          ref: refs/pull/${{ steps.pr.outputs.number }}/head
+          sha: ${{ github.event.workflow_run.head_sha }}
+
+  notify:
+    name: Notify PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Download PR metadata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: pr-metadata
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Read and validate PR number
+        id: pr
+        run: |
+          PR_NUMBER=$(cat pr-number.txt)
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: Invalid PR number: $PR_NUMBER"
+            exit 1
+          fi
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Check the PR is the one this run built
+        id: match
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          RUN_HEAD: ${{ github.event.workflow_run.head_sha }} ${{ github.event.workflow_run.head_repository.full_name }}
+        run: |
+          set -euo pipefail
+          pr_head="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq '"\(.head.sha) \(.head.repo.full_name)"')"
+          if [[ "${pr_head}" == "${RUN_HEAD}" ]]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::PR #${PR_NUMBER} is at '${pr_head}', this run built '${RUN_HEAD}'; skipping"
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download image reference
+        if: steps.match.outputs.current == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: image-ref
+          path: image-ref
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The reference comes out of a pull_request run and goes into a comment
+      # this token writes, so only the exact shape merge-manifests exports is
+      # accepted.
+      - name: Read and validate image reference
+        id: ref
+        if: steps.match.outputs.current == 'true'
+        run: |
+          set -euo pipefail
+          value="$(tr -d '[:space:]' < image-ref/robotlb.ref)"
+          if ! [[ "${value}" =~ ^ttl\.sh/treetscom-robotlb@sha256:[0-9a-f]{64}$ ]]; then
+            echo "ERROR: robotlb.ref is not a digest-pinned reference to ttl.sh/treetscom-robotlb"
+            exit 1
+          fi
+          echo "image=${value}" >> "$GITHUB_OUTPUT"
+
+      # One comment per PR, rewritten on every successful run: a comment
+      # naming an older build's digest would send readers to the wrong image.
+      - name: Comment on PR
+        if: steps.match.outputs.current == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          IMAGE_REF: ${{ steps.ref.outputs.image }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        with:
+          script: |
+            const marker = '<!-- ci-images -->';
+            const prNumber = Number(process.env.PR_NUMBER);
+            const fence = '```';
+
+            const body = [
+              marker,
+              '## Container image available',
+              '',
+              `Built from ${process.env.HEAD_SHA} in [this run](${process.env.RUN_URL}). Pull by digest: the \`pr-${prNumber}-1d\` tag on ttl.sh is anonymous, and anyone can overwrite it.`,
+              '',
+              `${fence}bash`,
+              `podman pull ${process.env.IMAGE_REF}`,
+              fence,
+              '',
+              '## Helm chart available',
+              '',
+              `${fence}bash`,
+              `helm install robotlb oci://ttl.sh/treetscom/robotlb --version 0.0.0-pr.${prNumber}-1d`,
+              fence,
+              '',
+              `The chart points at the \`pr-${prNumber}-1d\` image tag. ttl.sh expires both on its own schedule; re-run this PR's CI to republish.`,
+            ].join('\n');
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+            const existing = comments.find(
+              (c) => c.user?.login === 'github-actions[bot]' && c.body?.includes(marker),
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body,
+              });
+            }
