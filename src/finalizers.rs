@@ -1,10 +1,10 @@
 use k8s_openapi::{
     api::core::v1::Service,
-    serde_json::{json, Value},
+    serde_json::{Value, json},
 };
 use kube::{
-    api::{Patch, PatchParams},
     Api, Client, ResourceExt,
+    api::{Patch, PatchParams},
 };
 
 use crate::{
@@ -35,9 +35,7 @@ pub fn check(service: &Service) -> bool {
         .metadata
         .finalizers
         .as_ref()
-        .map_or(false, |finalizers| {
-            finalizers.contains(&consts::FINALIZER_NAME.to_string())
-        })
+        .is_some_and(|finalizers| finalizers.contains(&consts::FINALIZER_NAME.to_string()))
 }
 
 /// Remove finalizer from the service.

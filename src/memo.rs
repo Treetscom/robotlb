@@ -41,10 +41,10 @@ impl ReconcileMemo {
     pub fn settle(&self, svc: &Service, succeeded: bool) {
         let serves =
             svc.meta().deletion_timestamp.is_none() && crate::is_robotlb_load_balancer(svc);
-        if !(succeeded && serves) {
-            if let Some(uid) = svc.uid() {
-                self.forget(&uid);
-            }
+        if !(succeeded && serves)
+            && let Some(uid) = svc.uid()
+        {
+            self.forget(&uid);
         }
     }
 
@@ -86,7 +86,7 @@ pub fn fingerprint<S: BuildHasher>(
 
 #[cfg(test)]
 mod tests {
-    use super::{fingerprint, ReconcileMemo};
+    use super::{ReconcileMemo, fingerprint};
     use crate::consts;
     use k8s_openapi::{
         api::core::v1::{

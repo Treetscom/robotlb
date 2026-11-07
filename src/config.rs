@@ -1,3 +1,4 @@
+use crate::ip_mode::IPMode;
 use clap::Parser;
 use tracing::level_filters::LevelFilter;
 
@@ -6,6 +7,12 @@ pub struct OperatorConfig {
     /// `HCloud` API token.
     #[arg(short = 't', long, env = "ROBOTLB_HCLOUD_TOKEN")]
     pub hcloud_token: String,
+
+    /// Name of the cluster, put in front of default balancer names so that clusters
+    /// sharing a Hetzner project do not pick the same ones. A DNS label: lowercase
+    /// letters, digits and `-`, at most 63 characters.
+    #[arg(long, env = "ROBOTLB_CLUSTER_NAME", value_parser = crate::lb::parse_cluster_name)]
+    pub cluster_name: Option<String>,
 
     /// Default network to use for load balancers.
     /// If not set, then only network from the service annotation will be used.
@@ -30,13 +37,13 @@ pub struct OperatorConfig {
     pub default_lb_interval: i32,
 
     /// Default location of a load balancer.
-    /// https://docs.hetzner.com/cloud/general/locations/
+    /// <https://docs.hetzner.com/cloud/general/locations>/
     #[arg(long, env = "ROBOTLB_DEFAULT_LB_LOCATION", default_value = "hel1")]
     pub default_lb_location: String,
 
     /// Type of a load balancer. It differs in price, number of connections,
     /// target servers, etc. The default value is the smallest balancer.
-    /// https://docs.hetzner.com/cloud/load-balancers/overview#pricing
+    /// <https://docs.hetzner.com/cloud/load-balancers/overview#pricing>
     #[arg(long, env = "ROBOTLB_DEFAULT_LB_TYPE", default_value = "lb11")]
     pub default_balancer_type: String,
 
@@ -44,7 +51,8 @@ pub struct OperatorConfig {
     /// Possible values:
     /// * `least-connections`
     /// * `round-robin`
-    /// https://docs.hetzner.com/cloud/load-balancers/overview#load-balancers
+    ///
+    /// <https://docs.hetzner.com/cloud/load-balancers/overview#load-balancers>
     #[arg(
         long,
         env = "ROBOTLB_DEFAULT_LB_ALGORITHM",
@@ -54,13 +62,16 @@ pub struct OperatorConfig {
 
     /// Default load balancer proxy mode. If enabled, the load balancer will
     /// act as a proxy for the target servers. The default value is `false`.
-    /// https://docs.hetzner.com/cloud/load-balancers/faq/#what-does-proxy-protocol-mean-and-should-i-enable-it
+    /// <https://docs.hetzner.com/cloud/load-balancers/faq/#what-does-proxy-protocol-mean-and-should-i-enable-it>
     #[arg(
         long,
         env = "ROBOTLB_DEFAULT_LB_PROXY_MODE_ENABLED",
         default_value = "false"
     )]
     pub default_lb_proxy_mode_enabled: bool,
+
+    #[arg(long, env = "ROBOTLB_DEFAULT_IP_MODE", default_value = "VIP")]
+    pub default_ip_mode: IPMode,
 
     /// Whether to enable IPv6 ingress for the load balancer.
     /// If enabled, the load balancer's IPv6 will be attached to the service as an external IP along with IPv4.
@@ -87,6 +98,7 @@ pub struct OperatorConfig {
 #[cfg(test)]
 mod tests {
     use super::OperatorConfig;
+    use crate::ip_mode::IPMode;
     use clap::Parser;
 
     fn parse(resync: &str) -> Result<OperatorConfig, clap::Error> {
@@ -99,6 +111,16 @@ mod tests {
         ])
     }
 
+    fn parse_with_ip_mode(ip_mode: &str) -> Result<OperatorConfig, clap::Error> {
+        OperatorConfig::try_parse_from([
+            "robotlb",
+            "--hcloud-token",
+            "t",
+            "--default-ip-mode",
+            ip_mode,
+        ])
+    }
+
     // Zero would requeue every successful reconcile right away, spending Hetzner
     // API requests on every service all the time. The controller's delay queue
     // panics on delays past about two years.
@@ -108,5 +130,23 @@ mod tests {
         assert!(parse("31536001").is_err());
         assert_eq!(parse("31536000").unwrap().resync_interval, 31_536_000);
         assert_eq!(parse("1").unwrap().resync_interval, 1);
+    }
+
+    #[test]
+    fn the_ip_mode_defaults_to_vip() {
+        assert!(matches!(parse("300").unwrap().default_ip_mode, IPMode::VIP));
+    }
+
+    #[test]
+    fn the_ip_mode_can_be_set_to_proxy() {
+        assert!(matches!(
+            parse_with_ip_mode("Proxy").unwrap().default_ip_mode,
+            IPMode::Proxy
+        ));
+    }
+
+    #[test]
+    fn an_unknown_ip_mode_is_rejected() {
+        assert!(parse_with_ip_mode("vip").is_err());
     }
 }

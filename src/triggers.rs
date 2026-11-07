@@ -3,11 +3,11 @@ use k8s_openapi::api::{
     discovery::v1::EndpointSlice,
 };
 use kube::{
-    runtime::{reflector::ObjectRef, watcher::Event},
     ResourceExt,
+    runtime::{reflector::ObjectRef, watcher::Event},
 };
 use std::{
-    collections::{hash_map::DefaultHasher, BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     sync::Mutex,
 };
@@ -198,7 +198,7 @@ pub fn slice_service(slice: &EndpointSlice) -> Option<ObjectRef<Service>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{slice_nodes, slice_service, NodeChanges, SliceChanges};
+    use super::{NodeChanges, SliceChanges, slice_nodes, slice_service};
     use k8s_openapi::{
         api::{
             core::v1::{Node, NodeAddress, NodeCondition, NodeSpec, NodeStatus},
