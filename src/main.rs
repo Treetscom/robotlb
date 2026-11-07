@@ -19,7 +19,7 @@
 use backoff::ErrorBackoff;
 use clap::Parser;
 use config::OperatorConfig;
-use error::{redact, RobotLBError, RobotLBResult};
+use error::{RobotLBError, RobotLBResult, redact};
 use futures::StreamExt;
 use hcloud::apis::configuration::Configuration as HCloudConfig;
 use k8s_openapi::{
@@ -30,17 +30,18 @@ use k8s_openapi::{
     serde_json::json,
 };
 use kube::{
+    Resource, ResourceExt,
     api::{ListParams, PatchParams},
     runtime::{
+        Controller, WatchStreamExt,
         controller::{self, Action},
         events::{Event, EventType, Recorder, Reporter},
-        watcher, Controller, WatchStreamExt,
+        watcher,
     },
-    Resource, ResourceExt,
 };
 use label_filter::LabelFilter;
 use lb::{LBService, LoadBalancer};
-use rate_limit::{spread, RateLimitGate};
+use rate_limit::{RateLimitGate, spread};
 use std::{
     collections::HashSet,
     str::FromStr,
@@ -53,6 +54,7 @@ pub mod config;
 pub mod consts;
 pub mod error;
 pub mod finalizers;
+pub mod ip_mode;
 pub mod label_filter;
 pub mod lb;
 pub mod rate_limit;
@@ -182,11 +184,13 @@ fn cluster_changes(
     let node_client = client.clone();
     tokio::spawn(async move {
         let mut changes = triggers::NodeChanges::default();
-        let mut events = std::pin::pin!(watcher::watcher(
-            kube::Api::<Node>::all(node_client),
-            watcher::Config::default()
-        )
-        .default_backoff());
+        let mut events = std::pin::pin!(
+            watcher::watcher(
+                kube::Api::<Node>::all(node_client),
+                watcher::Config::default()
+            )
+            .default_backoff()
+        );
         while let Some(event) = events.next().await {
             match event {
                 Ok(event) => {
@@ -202,11 +206,13 @@ fn cluster_changes(
     // `Controller::reconcile_on` can target one. Once kube-runtime stabilizes it,
     // send the slice's service there instead and drop this watch's reconcile-all.
     tokio::spawn(async move {
-        let mut events = std::pin::pin!(watcher::metadata_watcher(
-            kube::Api::<EndpointSlice>::all(client),
-            watcher::Config::default()
-        )
-        .default_backoff());
+        let mut events = std::pin::pin!(
+            watcher::metadata_watcher(
+                kube::Api::<EndpointSlice>::all(client),
+                watcher::Config::default()
+            )
+            .default_backoff()
+        );
         while let Some(event) = events.next().await {
             match event {
                 Ok(event) => {
@@ -243,6 +249,7 @@ impl CurrentContext {
 }
 
 /// Reconcile the service.
+///
 /// This function is called by the controller for each service.
 /// It will create or update the load balancer based on the service.
 /// If the service is being deleted, it will clean up the resources.
@@ -255,10 +262,10 @@ pub async fn reconcile_service(
     if ends_backoff(&result) {
         context.error_backoff.forget(&service_key(&svc));
     }
-    if let Err(error) = &result {
-        if publishes_event(error) {
-            report_failure(&svc, &context, error).await;
-        }
+    if let Err(error) = &result
+        && publishes_event(error)
+    {
+        report_failure(&svc, &context, error).await;
     }
     result
 }
@@ -317,24 +324,55 @@ fn event_note(error: &RobotLBError, token: &str) -> String {
     note
 }
 
-async fn sync_service(svc: Arc<Service>, context: Arc<CurrentContext>) -> RobotLBResult<Action> {
-    let svc_type = svc
-        .spec
-        .as_ref()
-        .and_then(|s| s.type_.as_ref())
-        .map_or("ClusterIP", String::as_str);
-    if svc_type != "LoadBalancer" {
-        tracing::debug!("Service type is not LoadBalancer. Skipping...");
-        return Err(RobotLBError::SkipService);
-    }
+#[derive(Debug, PartialEq, Eq)]
+enum ServiceRole {
+    /// The service is not robotlb's.
+    Skip,
+    /// The service needs its load balancer created or updated.
+    Reconcile,
+    /// The service had a load balancer and no longer needs it.
+    Release,
+}
 
-    let lb_type = svc
+/// The API server wipes `loadBalancerClass` together with the `LoadBalancer` type,
+/// so once the type changes only the finalizer still marks the service as robotlb's,
+/// and a service with the finalizer that robotlb no longer serves gets released.
+fn service_role(svc: &Service) -> ServiceRole {
+    let is_load_balancer =
+        svc.spec.as_ref().and_then(|s| s.type_.as_deref()) == Some("LoadBalancer");
+    let class = svc
         .spec
         .as_ref()
-        .and_then(|s| s.load_balancer_class.as_ref())
-        .map_or(consts::ROBOTLB_LB_CLASS, String::as_str);
-    if lb_type != consts::ROBOTLB_LB_CLASS {
-        tracing::debug!("Load balancer class is not robotlb. Skipping...");
+        .and_then(|s| s.load_balancer_class.as_deref())
+        .unwrap_or(consts::ROBOTLB_LB_CLASS);
+    let is_robotlb = is_load_balancer && class == consts::ROBOTLB_LB_CLASS;
+    let owned = finalizers::check(svc);
+    let deleting = svc.meta().deletion_timestamp.is_some();
+    if (deleting && is_robotlb) || (owned && !is_robotlb) {
+        ServiceRole::Release
+    } else if is_robotlb && !deleting {
+        ServiceRole::Reconcile
+    } else {
+        ServiceRole::Skip
+    }
+}
+
+fn balancer_for(
+    role: &ServiceRole,
+    svc: &Service,
+    context: &CurrentContext,
+) -> RobotLBResult<LoadBalancer> {
+    if *role == ServiceRole::Release {
+        LoadBalancer::for_release(svc, context.hcloud_config.clone())
+    } else {
+        LoadBalancer::try_from_svc(svc, context)
+    }
+}
+
+async fn sync_service(svc: Arc<Service>, context: Arc<CurrentContext>) -> RobotLBResult<Action> {
+    let role = service_role(&svc);
+    if role == ServiceRole::Skip {
+        tracing::debug!("Service is not a robotlb load balancer. Skipping...");
         return Err(RobotLBError::SkipService);
     }
 
@@ -346,11 +384,10 @@ async fn sync_service(svc: Arc<Service>, context: Arc<CurrentContext>) -> RobotL
 
     tracing::info!("Starting service reconcilation");
 
-    let lb = LoadBalancer::try_from_svc(&svc, &context)?;
+    let lb = balancer_for(&role, &svc, &context)?;
 
-    // If the service is being deleted, we need to clean up the resources.
-    if svc.meta().deletion_timestamp.is_some() {
-        tracing::info!("Service deletion detected. Cleaning up resources.");
+    if role == ServiceRole::Release {
+        tracing::info!("Service no longer needs a load balancer. Cleaning up resources.");
         lb.cleanup().await?;
         finalizers::remove(context.client.clone(), &svc).await?;
         return Ok(Action::await_change());
@@ -572,6 +609,16 @@ pub async fn reconcile_load_balancer(
         lb.add_service(service.listen_port, service.target_port);
     }
 
+    // A balancer without a single service forwards nothing while still being billed,
+    // so none is created until the service has a port that can be exposed.
+    // An existing balancer and the address it gave the service are kept: a missing
+    // nodePort is far more likely a mistake than a request to delete the balancer.
+    if lb.services.is_empty() {
+        return Err(RobotLBError::NoExposablePorts);
+    }
+
+    let (hcloud_lb, targets_missing) = lb.reconcile().await?;
+
     let svc_api = kube::Api::<Service>::namespaced(
         context.client.clone(),
         svc.namespace()
@@ -579,39 +626,27 @@ pub async fn reconcile_load_balancer(
             .as_str(),
     );
 
-    // A balancer without a single service forwards nothing while still being billed,
-    // so none is created until the service has a port that can be exposed.
-    if lb.services.is_empty() {
-        tracing::warn!("Service has no port that can be exposed. Skipping the load balancer.");
-        clear_ingress_status(&svc_api, &svc).await?;
-        return Ok(Action::requeue(Duration::from_secs(
-            context.config.resync_interval,
-        )));
-    }
-
-    let (hcloud_lb, targets_missing) = lb.reconcile().await?;
-
     let mut ingress = vec![];
 
-    let dns_ipv4 = hcloud_lb.public_net.ipv4.dns_ptr.flatten();
-    let ipv4 = hcloud_lb.public_net.ipv4.ip.flatten();
-    let dns_ipv6 = hcloud_lb.public_net.ipv6.dns_ptr.flatten();
-    let ipv6 = hcloud_lb.public_net.ipv6.ip.flatten();
+    let dns_ipv4 = hcloud_lb.public_net.ipv4.dns_ptr;
+    let ipv4 = hcloud_lb.public_net.ipv4.ip;
+    let dns_ipv6 = hcloud_lb.public_net.ipv6.dns_ptr;
+    let ipv6 = hcloud_lb.public_net.ipv6.ip;
     if let Some(ipv4) = &ipv4 {
         ingress.push(json!({
             "ip": ipv4,
             "dns": dns_ipv4,
-            "ip_mode": "VIP"
+            "ipMode": &lb.ip_type
         }));
     }
-    if context.config.ipv6_ingress {
-        if let Some(ipv6) = &ipv6 {
-            ingress.push(json!({
-                "ip": ipv6,
-                "dns": dns_ipv6,
-                "ip_mode": "VIP"
-            }));
-        }
+    if context.config.ipv6_ingress
+        && let Some(ipv6) = &ipv6
+    {
+        ingress.push(json!({
+            "ip": ipv6,
+            "dns": dns_ipv6,
+            "ipMode": &lb.ip_type
+        }));
     }
 
     if !ingress.is_empty() {
@@ -646,35 +681,6 @@ const fn success_requeue(targets_missing: bool, resync_interval: u64) -> Duratio
     }
 }
 
-/// Drop the external IP a service advertises, so that nothing keeps sending
-/// traffic to a load balancer that no longer forwards it.
-async fn clear_ingress_status(svc_api: &kube::Api<Service>, svc: &Service) -> RobotLBResult<()> {
-    let advertises_ingress = svc
-        .status
-        .as_ref()
-        .and_then(|status| status.load_balancer.as_ref())
-        .and_then(|lb| lb.ingress.as_ref())
-        .is_some_and(|ingress| !ingress.is_empty());
-    if !advertises_ingress {
-        return Ok(());
-    }
-    tracing::info!("Removing the external IP from the service status");
-    svc_api
-        .patch_status(
-            svc.name_any().as_str(),
-            &PatchParams::default(),
-            &kube::api::Patch::Merge(json!({
-                "status": {
-                    "loadBalancer": {
-                        "ingress": null
-                    }
-                }
-            })),
-        )
-        .await?;
-    Ok(())
-}
-
 /// Handle the error during reconcilation.
 #[allow(clippy::needless_pass_by_value)]
 fn on_error(svc: Arc<Service>, error: &RobotLBError, context: Arc<CurrentContext>) -> Action {
@@ -707,10 +713,12 @@ fn error_action(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_lb_services, consts, error_action, event_note, is_excluded_from_lb,
-        is_lb_eligible_node, is_local_traffic_policy, node_source, publishes_event, slice_triggers,
-        success_requeue, NodeSource,
+        CurrentContext, HCloudConfig, NodeSource, OperatorConfig, RobotLBError, ServiceRole,
+        balancer_for, collect_lb_services, consts, error_action, event_note, is_excluded_from_lb,
+        is_lb_eligible_node, is_local_traffic_policy, node_source, publishes_event, service_role,
+        slice_triggers, success_requeue,
     };
+    use clap::Parser;
     use k8s_openapi::{
         api::core::v1::{
             Node, NodeCondition, NodeSpec, NodeStatus, Service, ServicePort, ServiceSpec,
@@ -718,6 +726,31 @@ mod tests {
         apimachinery::pkg::apis::meta::v1::ObjectMeta,
     };
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn only_a_reconciliation_reads_the_annotations() {
+        let config = OperatorConfig::try_parse_from(["robotlb", "--hcloud-token", "t"]).unwrap();
+        let client =
+            kube::Client::try_from(kube::Config::new("http://127.0.0.1:1".parse().unwrap()))
+                .unwrap();
+        let context = CurrentContext::new(client, config, HCloudConfig::default());
+        let svc = Service {
+            metadata: ObjectMeta {
+                uid: Some("uid-1".to_string()),
+                annotations: Some(
+                    [(consts::LB_RETRIES_ANN_NAME.to_string(), "abc".to_string())].into(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(balancer_for(&ServiceRole::Release, &svc, &context).is_ok());
+        assert!(balancer_for(&ServiceRole::Reconcile, &svc, &context).is_err());
+        assert!(matches!(
+            balancer_for(&ServiceRole::Release, &Service::default(), &context),
+            Err(RobotLBError::SkipService)
+        ));
+    }
 
     fn service(spec: ServiceSpec) -> Service {
         Service {
@@ -1039,6 +1072,20 @@ mod tests {
         assert!(publishes_event(&RobotLBError::HCloudError(
             "boom".to_string()
         )));
+        assert!(publishes_event(&RobotLBError::UnrecognisedBalancer {
+            name: "web".to_string(),
+            uid: "uid-1".to_string(),
+        }));
+        assert!(publishes_event(&RobotLBError::ForeignBalancer {
+            name: "web".to_string(),
+            owner: "uid-2".to_string(),
+        }));
+        assert!(publishes_event(&RobotLBError::NoNodesToRecogniseBalancer(
+            "web".to_string()
+        )));
+        assert!(publishes_event(&RobotLBError::AmbiguousBalancer(
+            "web".to_string()
+        )));
     }
 
     fn endpoint_slice(node: &str) -> k8s_openapi::api::discovery::v1::EndpointSlice {
@@ -1179,5 +1226,102 @@ mod tests {
         assert_eq!(success_requeue(true, 300), Duration::from_secs(30));
         assert_eq!(success_requeue(false, 300), Duration::from_secs(300));
         assert_eq!(success_requeue(true, 10), Duration::from_secs(10));
+    }
+
+    fn owned_service(type_: &str, class: Option<&str>, deleting: bool) -> Service {
+        Service {
+            metadata: ObjectMeta {
+                finalizers: Some(vec![consts::FINALIZER_NAME.to_string()]),
+                deletion_timestamp: deleting.then(|| {
+                    k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                        k8s_openapi::chrono::Utc::now(),
+                    )
+                }),
+                ..Default::default()
+            },
+            spec: Some(ServiceSpec {
+                type_: Some(type_.to_string()),
+                load_balancer_class: class.map(str::to_string),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_robotlb_load_balancer_is_reconciled() {
+        let svc = service(ServiceSpec {
+            type_: Some("LoadBalancer".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(service_role(&svc), ServiceRole::Reconcile);
+        let svc = owned_service("LoadBalancer", Some(consts::ROBOTLB_LB_CLASS), false);
+        assert_eq!(service_role(&svc), ServiceRole::Reconcile);
+    }
+
+    #[test]
+    fn services_robotlb_does_not_own_are_skipped() {
+        let other_class = service(ServiceSpec {
+            type_: Some("LoadBalancer".to_string()),
+            load_balancer_class: Some("example.com/other".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(service_role(&other_class), ServiceRole::Skip);
+        let cluster_ip = service(ServiceSpec {
+            type_: Some("ClusterIP".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(service_role(&cluster_ip), ServiceRole::Skip);
+        let mut deleting_cluster_ip = owned_service("ClusterIP", None, true);
+        deleting_cluster_ip.metadata.finalizers = None;
+        assert_eq!(service_role(&deleting_cluster_ip), ServiceRole::Skip);
+        let mut deleting_other_class =
+            owned_service("LoadBalancer", Some("example.com/other"), true);
+        deleting_other_class.metadata.finalizers = None;
+        assert_eq!(service_role(&deleting_other_class), ServiceRole::Skip);
+    }
+
+    // A type change and a change back with another class can both land before robotlb
+    // reconciles, for example while the rate limit gate is closed.
+    #[test]
+    fn an_owned_service_taken_over_by_another_class_is_released() {
+        let svc = owned_service("LoadBalancer", Some("example.com/other"), false);
+        assert_eq!(service_role(&svc), ServiceRole::Release);
+    }
+
+    // Reachable when the finalizer was removed by hand while another controller's
+    // finalizer still holds the object.
+    #[test]
+    fn a_deleted_robotlb_load_balancer_without_the_finalizer_is_released() {
+        let mut svc = owned_service("LoadBalancer", None, true);
+        svc.metadata.finalizers = None;
+        assert_eq!(service_role(&svc), ServiceRole::Release);
+    }
+
+    #[test]
+    fn an_owned_service_that_stopped_being_a_load_balancer_is_released() {
+        assert_eq!(
+            service_role(&owned_service("ClusterIP", None, false)),
+            ServiceRole::Release
+        );
+    }
+
+    #[test]
+    fn a_deleted_owned_service_is_released() {
+        assert_eq!(
+            service_role(&owned_service("LoadBalancer", None, true)),
+            ServiceRole::Release
+        );
+        assert_eq!(
+            service_role(&owned_service("ClusterIP", None, true)),
+            ServiceRole::Release
+        );
+    }
+
+    #[test]
+    fn a_service_without_exposable_ports_reports_an_event() {
+        let error = crate::error::RobotLBError::NoExposablePorts;
+        assert!(publishes_event(&error));
+        assert!(error.to_string().starts_with("No TCP port"));
     }
 }

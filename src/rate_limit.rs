@@ -56,10 +56,10 @@ impl RateLimitGate {
         if let Some(remaining) = state.remaining(now) {
             return remaining;
         }
-        if let Some(reopened) = state.closed_until {
-            if now >= reopened + state.last_delay {
-                state.consecutive = 0;
-            }
+        if let Some(reopened) = state.closed_until
+            && now >= reopened + state.last_delay
+        {
+            state.consecutive = 0;
         }
         let delay = FIRST_DELAY * 2_u32.pow(state.consecutive.min(MAX_DOUBLINGS));
         state.consecutive += 1;
@@ -83,7 +83,7 @@ pub fn spread(wait: Duration, service: &str) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::{spread, RateLimitGate};
+    use super::{RateLimitGate, spread};
     use std::time::{Duration, Instant};
 
     #[test]

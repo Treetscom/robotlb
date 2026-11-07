@@ -1,4 +1,6 @@
 pub const LB_NAME_LABEL_NAME: &str = "robotlb/balancer";
+/// Hetzner label on every balancer robotlb manages: the UID of the service it serves.
+pub const LB_OWNER_LABEL: &str = "robotlb/service-uid";
 pub const LB_NODE_SELECTOR: &str = "robotlb/node-selector";
 
 // LB config
@@ -12,6 +14,7 @@ pub const LB_PRIVATE_IP_LABEL_NAME: &str = "robotlb/lb-private-ip";
 pub const LB_LOCATION_LABEL_NAME: &str = "robotlb/lb-location";
 pub const LB_ALGORITHM_LABEL_NAME: &str = "robotlb/lb-algorithm";
 pub const LB_BALANCER_TYPE_LABEL_NAME: &str = "robotlb/balancer-type";
+pub const LB_IP_MODE_LABEL_NAME: &str = "robotlb/ip-mode";
 
 pub const DEFAULT_LB_RETRIES: i32 = 3;
 pub const DEFAULT_LB_TIMEOUT: i32 = 10;
